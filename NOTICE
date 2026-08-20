@@ -1,0 +1,11 @@
+ESP32-S3-BOX-3 Baby Monitor
+
+Original project source and documentation are licensed under Apache-2.0.
+
+Third-party build dependencies retain their own licenses and are not relicensed by this project.
+
+Important dependency:
+- espressif/esp_audio_codec 2.6.2 uses the Espressif Modified MIT License
+  (LicenseRef-Espressif-Modified-MIT) and is restricted to use with Espressif Systems products.
+
+See THIRD_PARTY_NOTICES.md and docs/licensing.md for details.

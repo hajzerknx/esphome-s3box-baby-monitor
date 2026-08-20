@@ -1,0 +1,1192 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# ESP32-S3-BOX-3 Baby Monitor — v1.0.0
+#
+# Copy secrets.example.yaml to secrets.yaml and configure your own values.
+# Cry detection is disabled by default. To enable an external crying classifier,
+# uncomment the package block below and configure the optional package.
+#
+# packages:
+#   cry_detection: !include examples/cry-detection-home-assistant.yaml
+
+substitutions:
+  name: baby-monitor-box3
+  friendly_name: Baby Monitor BOX-3
+
+  camera_1_motion_entity: binary_sensor.camera_1_motion
+  camera_1_sound_entity: sensor.camera_1_sound_level
+  camera_2_motion_entity: binary_sensor.camera_2_motion
+  camera_2_sound_entity: sensor.camera_2_sound_level
+
+  camera_user: !secret baby_monitor_box3__camera_user
+  camera_password: !secret baby_monitor_box3__camera_password
+
+  camera_1_host: !secret baby_monitor_camera_1_host
+  camera_2_host: !secret baby_monitor_camera_2_host
+  camera_rtsp_path: "/cam/realmonitor?channel=1&subtype=1"
+
+  battery_voltage_factor: "4.01"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.7.4
+  on_boot:
+    priority: -100
+    then:
+      - delay: 250ms
+      - lambda: |-
+          id(hardware_mute_active) = id(hardware_mute_status).state;
+          const bool effective = id(audio_ha_requested) && !id(hardware_mute_active);
+          id(camera_audio_enabled).publish_state(effective);
+          id(baby_monitor_media).set_audio_enabled(effective);
+          id(speaker_amp_enable).turn_off();
+          ESP_LOGI("baby_mute", "Boot sync: requested=%s hardware=%s effective=%s",
+                   id(audio_ha_requested) ? "ON" : "OFF",
+                   id(hardware_mute_active) ? "MUTED" : "UNMUTED",
+                   effective ? "ON" : "OFF");
+
+esp32:
+  board: esp32s3box
+  flash_size: 16MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+
+psram:
+  mode: octal
+  speed: 80MHz
+  ignore_not_found: false
+
+logger:
+  level: INFO
+  hardware_uart: USB_SERIAL_JTAG
+
+api:
+
+ota:
+  - platform: esphome
+
+safe_mode:
+  num_attempts: 3
+  boot_is_good_after: 30s
+
+network:
+  enable_high_performance: true
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+
+  manual_ip:
+    static_ip: !secret baby_monitor_static_ip
+    gateway: !secret network_gateway
+    subnet: !secret network_subnet
+
+spi:
+  - id: spi_bus
+    clk_pin: GPIO7
+    mosi_pin: GPIO6
+
+display:
+  - platform: mipi_spi
+    id: box_display
+    model: S3BOX
+    invert_colors: false
+    data_rate: 40MHz
+    cs_pin: GPIO5
+    dc_pin: GPIO4
+    reset_pin:
+      number: GPIO48
+      inverted: true
+    color_depth: 16
+    byte_order: big_endian
+    buffer_size: 0.12
+    auto_clear_enabled: false
+    update_interval: never
+
+
+i2c:
+  - id: audio_i2c
+    sda: GPIO8
+    scl: GPIO18
+    frequency: 100kHz
+
+touchscreen:
+  - platform: gt911
+    id: box_touch
+    i2c_id: audio_i2c
+    address: 0x5D
+    display: box_display
+    interrupt_pin:
+      number: GPIO3
+      ignore_strapping_warning: true
+
+    on_touch:
+      - if:
+          condition:
+            switch.is_off: monitor_power
+          then:
+            - switch.turn_on: monitor_power
+          else:
+            - if:
+                condition:
+                  switch.is_off: night_mode
+                then:
+                  - select.next:
+                      id: camera_select
+                      cycle: true
+                else:
+                  - lambda: 'return;'
+
+audio_dac:
+  - platform: es8311
+    id: es8311_dac
+    i2c_id: audio_i2c
+    address: 0x18
+    bits_per_sample: 16bit
+    sample_rate: 16000
+    use_mclk: true
+    use_microphone: false
+
+i2s_audio:
+  - id: i2s_output
+    i2s_lrclk_pin:
+      number: GPIO45
+      ignore_strapping_warning: true
+    i2s_bclk_pin: GPIO17
+    i2s_mclk_pin: GPIO2
+
+speaker:
+  - platform: i2s_audio
+    id: monitor_speaker
+    i2s_audio_id: i2s_output
+    i2s_dout_pin: GPIO15
+    dac_type: external
+    audio_dac: es8311_dac
+    channel: left
+    sample_rate: 16000
+    bits_per_sample: 16bit
+    buffer_duration: 180ms
+    timeout: never
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [baby_monitor]
+
+baby_monitor:
+  id: baby_monitor_media
+  display: box_display
+  speaker: monitor_speaker
+  audio_volume: 5%
+
+  camera_1:
+    name: "Camera 1"
+    host: ${camera_1_host}
+    port: 554
+    username: ${camera_user}
+    password: ${camera_password}
+    path: "${camera_rtsp_path}"
+
+  camera_2:
+    name: "Camera 2"
+    host: ${camera_2_host}
+    port: 554
+    username: ${camera_user}
+    password: ${camera_password}
+    path: "${camera_rtsp_path}"
+
+globals:
+  - id: active_camera_index
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+  - id: camera_1_baseline
+    type: float
+    restore_value: no
+    initial_value: "-76.0"
+  - id: camera_2_baseline
+    type: float
+    restore_value: no
+    initial_value: "-65.0"
+
+  - id: camera_1_ambient_candidate
+    type: float
+    restore_value: no
+    initial_value: "NAN"
+  - id: camera_1_ambient_min
+    type: float
+    restore_value: no
+    initial_value: "NAN"
+  - id: camera_1_ambient_max
+    type: float
+    restore_value: no
+    initial_value: "NAN"
+  - id: camera_1_ambient_started_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: camera_1_ambient_nudge_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: camera_2_ambient_candidate
+    type: float
+    restore_value: no
+    initial_value: "NAN"
+  - id: camera_2_ambient_min
+    type: float
+    restore_value: no
+    initial_value: "NAN"
+  - id: camera_2_ambient_max
+    type: float
+    restore_value: no
+    initial_value: "NAN"
+  - id: camera_2_ambient_started_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: camera_2_ambient_nudge_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: camera_audio_volume_pct
+    type: float
+    restore_value: yes
+    initial_value: "25.0"
+
+  - id: audio_ha_requested
+    type: bool
+    restore_value: yes
+    initial_value: "true"
+  - id: hardware_mute_active
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: camera_1_t1_offset
+    type: float
+    restore_value: yes
+    initial_value: "15.0"
+  - id: camera_1_t2_offset
+    type: float
+    restore_value: yes
+    initial_value: "32.0"
+  - id: camera_1_t1_floor
+    type: float
+    restore_value: yes
+    initial_value: "-60.0"
+  - id: camera_1_t2_floor
+    type: float
+    restore_value: yes
+    initial_value: "-40.0"
+
+  - id: camera_2_t1_offset
+    type: float
+    restore_value: yes
+    initial_value: "20.0"
+  - id: camera_2_t2_offset
+    type: float
+    restore_value: yes
+    initial_value: "30.0"
+  - id: camera_2_t1_floor
+    type: float
+    restore_value: yes
+    initial_value: "-45.0"
+  - id: camera_2_t2_floor
+    type: float
+    restore_value: yes
+    initial_value: "-32.0"
+
+  - id: alarm_t1_confirm_ms
+    type: uint32_t
+    restore_value: yes
+    initial_value: "1000"
+  - id: alarm_t2_confirm_ms
+    type: uint32_t
+    restore_value: yes
+    initial_value: "1000"
+
+  - id: camera_1_motion_until
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: camera_1_sound1_until
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: camera_1_sound2_until
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: camera_1_external_level2_until
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: camera_2_motion_until
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: camera_2_sound1_until
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: camera_2_sound2_until
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: camera_2_external_level2_until
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: camera_1_sound_gate
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: camera_2_sound_gate
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: camera_1_t1_started
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: camera_1_t2_started
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: camera_2_t1_started
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: camera_2_t2_started
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: camera_1_ha_last_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: camera_2_ha_last_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: night_wake_until
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: night_alarm_wake_seconds
+    type: float
+    restore_value: yes
+    initial_value: "30.0"
+
+  - id: active_alarm_level
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: active_alarm_baseline
+    type: float
+    restore_value: no
+    initial_value: "NAN"
+  - id: active_alarm_t1
+    type: float
+    restore_value: no
+    initial_value: "NAN"
+  - id: active_alarm_t2
+    type: float
+    restore_value: no
+    initial_value: "NAN"
+
+output:
+  - platform: gpio
+    id: backlight_output
+    pin: GPIO47
+
+  - platform: gpio
+    id: speaker_amp_enable
+    pin: GPIO46
+
+
+switch:
+  - platform: template
+    id: monitor_power
+    name: "Monitor"
+    icon: "mdi:monitor-speaker"
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+
+    turn_on_action:
+      - output.turn_on: backlight_output
+      - lambda: |-
+          const bool effective_audio = id(audio_ha_requested) && !id(hardware_mute_active);
+          id(camera_audio_enabled).publish_state(effective_audio);
+          id(baby_monitor_media).set_audio_enabled(effective_audio);
+          if (effective_audio) id(speaker_amp_enable).turn_on();
+          else id(speaker_amp_enable).turn_off();
+      - delay: 20ms
+      - lambda: |-
+          id(camera_1_motion_until) = id(camera_1_sound1_until) = id(camera_1_sound2_until) = id(camera_1_external_level2_until) = 0;
+          id(camera_2_motion_until) = id(camera_2_sound1_until) = id(camera_2_sound2_until) = id(camera_2_external_level2_until) = 0;
+          id(camera_1_sound_gate) = false;
+          id(camera_2_sound_gate) = false;
+          id(active_alarm_level) = 0;
+          id(baby_monitor_media).set_alarm_level(0);
+          id(baby_monitor_media).set_audio_enabled(id(audio_ha_requested) && !id(hardware_mute_active));
+          id(baby_monitor_media).set_audio_volume((id(camera_audio_volume_pct) / 100.0f) * 0.20f);
+          id(baby_monitor_media).set_enabled(true);
+
+    turn_off_action:
+      - lambda: |-
+          if (id(night_mode).state) id(night_mode).publish_state(false);
+          id(night_wake_until) = 0;
+          id(active_alarm_level) = 0;
+          id(baby_monitor_media).set_alarm_level(0);
+          id(camera_1_motion_until) = id(camera_1_sound1_until) = id(camera_1_sound2_until) = id(camera_1_external_level2_until) = 0;
+          id(camera_2_motion_until) = id(camera_2_sound1_until) = id(camera_2_sound2_until) = id(camera_2_external_level2_until) = 0;
+          id(camera_1_sound_gate) = false;
+          id(camera_2_sound_gate) = false;
+          id(baby_monitor_media).set_enabled(false);
+      - output.turn_off: speaker_amp_enable
+      - output.turn_off: backlight_output
+
+  - platform: template
+    id: night_mode
+    name: "Night Mode"
+    icon: "mdi:weather-night"
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+
+    turn_on_action:
+      - if:
+          condition:
+            switch.is_off: monitor_power
+          then:
+            - switch.turn_on: monitor_power
+            - delay: 50ms
+      - lambda: id(night_wake_until) = 0;
+      - output.turn_off: backlight_output
+
+    turn_off_action:
+      - lambda: id(night_wake_until) = 0;
+      - if:
+          condition:
+            switch.is_on: monitor_power
+          then:
+            - output.turn_on: backlight_output
+
+  - platform: template
+    id: camera_audio_enabled
+    name: "Camera Audio"
+    icon: "mdi:volume-high"
+    optimistic: true
+    restore_mode: DISABLED
+    turn_on_action:
+      - lambda: |-
+          id(audio_ha_requested) = true;
+          const bool effective = !id(hardware_mute_active);
+          id(camera_audio_enabled).publish_state(effective);
+          id(baby_monitor_media).set_audio_enabled(effective);
+          if (effective && id(monitor_power).state) id(speaker_amp_enable).turn_on();
+          else id(speaker_amp_enable).turn_off();
+    turn_off_action:
+      - lambda: |-
+          id(audio_ha_requested) = false;
+          id(camera_audio_enabled).publish_state(false);
+          id(baby_monitor_media).set_audio_enabled(false);
+          id(speaker_amp_enable).turn_off();
+
+select:
+  - platform: template
+    id: camera_select
+    name: "Camera"
+    icon: "mdi:cctv"
+    optimistic: true
+    restore_value: false
+    initial_option: "Camera 1"
+    options:
+      - "Camera 1"
+      - "Camera 2"
+
+    set_action:
+      - lambda: |-
+          id(active_alarm_level) = 0;
+          id(baby_monitor_media).set_alarm_level(0);
+          id(camera_1_motion_until) = id(camera_1_sound1_until) = id(camera_1_sound2_until) = id(camera_1_external_level2_until) = 0;
+          id(camera_2_motion_until) = id(camera_2_sound1_until) = id(camera_2_sound2_until) = id(camera_2_external_level2_until) = 0;
+          id(camera_1_sound_gate) = false;
+          id(camera_2_sound_gate) = false;
+          if (x == "Camera 2") {
+            id(active_camera_index) = 1;
+            id(baby_monitor_media).set_camera(1);
+          } else {
+            id(active_camera_index) = 0;
+            id(baby_monitor_media).set_camera(0);
+          }
+
+
+number:
+  - platform: template
+    id: night_alarm_wake_time
+    name: "Alarm Wake Time"
+    icon: "mdi:timer-outline"
+    entity_category: config
+    unit_of_measurement: "s"
+    min_value: 10
+    max_value: 120
+    step: 5
+    optimistic: true
+    restore_value: true
+    initial_value: 30
+    set_action:
+      - lambda: id(night_alarm_wake_seconds) = x;
+
+  - platform: template
+    id: camera_audio_volume
+    name: "Camera Volume"
+    icon: "mdi:volume-medium"
+    entity_category: config
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 5
+    optimistic: true
+    restore_value: true
+    initial_value: 25
+    set_action:
+      - lambda: |-
+          id(camera_audio_volume_pct) = x;
+          id(baby_monitor_media).set_audio_volume((x / 100.0f) * 0.20f);
+
+  - platform: template
+    id: camera_1_t1_offset_number
+    name: "Camera 1 T1 offset"
+    icon: "mdi:tune-vertical"
+    entity_category: config
+    unit_of_measurement: "dB"
+    min_value: 5
+    max_value: 35
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 15
+    set_action:
+      - lambda: id(camera_1_t1_offset) = x;
+
+  - platform: template
+    id: camera_1_t1_floor_number
+    name: "Camera 1 T1 floor"
+    icon: "mdi:volume-medium"
+    entity_category: config
+    unit_of_measurement: "dB"
+    min_value: -75
+    max_value: -30
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: -60
+    set_action:
+      - lambda: id(camera_1_t1_floor) = x;
+
+  - platform: template
+    id: camera_1_t2_offset_number
+    name: "Camera 1 T2 offset"
+    icon: "mdi:tune-vertical"
+    entity_category: config
+    unit_of_measurement: "dB"
+    min_value: 10
+    max_value: 45
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 32
+    set_action:
+      - lambda: id(camera_1_t2_offset) = x;
+
+  - platform: template
+    id: camera_1_t2_floor_number
+    name: "Camera 1 T2 floor"
+    icon: "mdi:volume-high"
+    entity_category: config
+    unit_of_measurement: "dB"
+    min_value: -65
+    max_value: -20
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: -40
+    set_action:
+      - lambda: id(camera_1_t2_floor) = x;
+
+  - platform: template
+    id: camera_2_t1_offset_number
+    name: "Camera 2 T1 offset"
+    icon: "mdi:tune-vertical"
+    entity_category: config
+    unit_of_measurement: "dB"
+    min_value: 5
+    max_value: 35
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 20
+    set_action:
+      - lambda: id(camera_2_t1_offset) = x;
+
+  - platform: template
+    id: camera_2_t1_floor_number
+    name: "Camera 2 T1 floor"
+    icon: "mdi:volume-medium"
+    entity_category: config
+    unit_of_measurement: "dB"
+    min_value: -75
+    max_value: -25
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: -45
+    set_action:
+      - lambda: id(camera_2_t1_floor) = x;
+
+  - platform: template
+    id: camera_2_t2_offset_number
+    name: "Camera 2 T2 offset"
+    icon: "mdi:tune-vertical"
+    entity_category: config
+    unit_of_measurement: "dB"
+    min_value: 10
+    max_value: 45
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 30
+    set_action:
+      - lambda: id(camera_2_t2_offset) = x;
+
+  - platform: template
+    id: camera_2_t2_floor_number
+    name: "Camera 2 T2 floor"
+    icon: "mdi:volume-high"
+    entity_category: config
+    unit_of_measurement: "dB"
+    min_value: -60
+    max_value: -15
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: -32
+    set_action:
+      - lambda: id(camera_2_t2_floor) = x;
+
+  - platform: template
+    id: alarm_t1_confirm_number
+    name: "Alarm T1 Confirmation"
+    icon: "mdi:timer-outline"
+    entity_category: config
+    unit_of_measurement: "s"
+    min_value: 0.25
+    max_value: 5.0
+    step: 0.25
+    optimistic: true
+    restore_value: true
+    initial_value: 1.0
+    set_action:
+      - lambda: id(alarm_t1_confirm_ms) = (uint32_t) lroundf(x * 1000.0f);
+
+  - platform: template
+    id: alarm_t2_confirm_number
+    name: "Alarm T2 Confirmation"
+    icon: "mdi:timer-alert-outline"
+    entity_category: config
+    unit_of_measurement: "s"
+    min_value: 0.25
+    max_value: 3.0
+    step: 0.25
+    optimistic: true
+    restore_value: true
+    initial_value: 1.0
+    set_action:
+      - lambda: id(alarm_t2_confirm_ms) = (uint32_t) lroundf(x * 1000.0f);
+
+text_sensor:
+  - platform: template
+    id: last_alarm_reason
+    name: "Last Alarm Reason"
+    icon: "mdi:alarm-note"
+    entity_category: diagnostic
+    update_interval: never
+
+binary_sensor:
+  - platform: gt911
+    id: home_button
+    gt911_id: box_touch
+    index: 0
+    internal: true
+    on_press:
+      - if:
+          condition:
+            switch.is_on: night_mode
+          then:
+            - switch.turn_off: night_mode
+          else:
+            - if:
+                condition:
+                  switch.is_on: monitor_power
+                then:
+                  - switch.turn_off: monitor_power
+                else:
+                  - switch.turn_on: monitor_power
+
+  - platform: gpio
+    id: night_mode_button
+    internal: true
+    pin:
+      number: GPIO0
+      mode: INPUT_PULLUP
+      inverted: true
+      ignore_strapping_warning: true
+    filters:
+      - delayed_on: 30ms
+      - delayed_off: 30ms
+    on_press:
+      - switch.toggle: night_mode
+
+  - platform: gpio
+    id: hardware_mute_status
+    internal: true
+    pin:
+      number: GPIO1
+      mode: INPUT_PULLUP
+      inverted: true
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 20ms
+    on_state:
+      - lambda: |-
+          id(hardware_mute_active) = x;
+          const bool effective = id(audio_ha_requested) && !x;
+          id(camera_audio_enabled).publish_state(effective);
+          id(baby_monitor_media).set_audio_enabled(effective);
+          if (effective && id(monitor_power).state) id(speaker_amp_enable).turn_on();
+          else id(speaker_amp_enable).turn_off();
+          ESP_LOGI("baby_mute", "Hardware MUTE=%s -> effective audio=%s", x ? "ON" : "OFF", effective ? "ON" : "OFF");
+
+  - platform: homeassistant
+    id: camera_1_motion
+    entity_id: ${camera_1_motion_entity}
+    internal: true
+    on_press:
+      - lambda: |-
+          if (id(monitor_power).state && id(active_camera_index) == 0) {
+            id(camera_1_motion_until) = millis() + 20000UL;
+            ESP_LOGI("alarm", "Camera 1: motion -> hold 20s");
+          }
+
+  - platform: homeassistant
+    id: camera_2_motion
+    entity_id: ${camera_2_motion_entity}
+    internal: true
+    on_press:
+      - lambda: |-
+          if (id(monitor_power).state && id(active_camera_index) == 1) {
+            id(camera_2_motion_until) = millis() + 20000UL;
+            ESP_LOGI("alarm", "Camera 2: motion -> hold 20s");
+          }
+
+  - platform: template
+    id: rtsp_connected
+    name: "RTSP Connected"
+    icon: "mdi:lan-connect"
+    entity_category: diagnostic
+    lambda: |-
+      return id(baby_monitor_media).is_rtsp_connected();
+
+sensor:
+  - platform: adc
+    id: battery_voltage
+    name: "Battery Voltage"
+    pin: GPIO10
+    attenuation: auto
+    update_interval: 30s
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 2
+    filters:
+      - multiply: ${battery_voltage_factor}
+      - median:
+          window_size: 5
+          send_every: 1
+          send_first_at: 1
+
+  - platform: template
+    id: battery_percent
+    name: "Battery Level"
+    icon: "mdi:battery"
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: |-
+      const float v=id(battery_voltage).state;
+      if (isnan(v) || v < 2.5f || v > 4.5f) return NAN;
+      struct P { float v,p; };
+      static const P c[]={{3.20f,0},{3.30f,5},{3.50f,10},{3.60f,20},{3.70f,35},{3.75f,45},{3.80f,55},{3.85f,65},{3.90f,75},{4.00f,85},{4.10f,95},{4.20f,100}};
+      float pct=0;
+      if (v<=c[0].v) pct=0; else if (v>=c[11].v) pct=100; else {
+        for (int i=1;i<12;i++) if (v<=c[i].v) { pct=c[i-1].p+(v-c[i-1].v)*(c[i].p-c[i-1].p)/(c[i].v-c[i-1].v); break; }
+      }
+      id(baby_monitor_media).set_ui_battery_percent(pct);
+      return pct;
+
+  - platform: wifi_signal
+    id: wifi_rssi
+    name: "Wi-Fi RSSI"
+    icon: "mdi:wifi"
+    update_interval: 30s
+    entity_category: diagnostic
+
+  - platform: template
+    id: wifi_quality
+    name: "Wi-Fi Quality"
+    icon: "mdi:wifi-strength-2"
+    unit_of_measurement: "%"
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: |-
+      const float r=id(wifi_rssi).state;
+      if (isnan(r)) return NAN;
+      if (r <= -100.0f) return 0.0f;
+      if (r >= -50.0f) return 100.0f;
+      return 2.0f * (r + 100.0f);
+
+  - platform: homeassistant
+    id: camera_1_sound_level
+    entity_id: ${camera_1_sound_entity}
+    internal: true
+    on_value:
+      - lambda: |-
+          if (isnan(x)) return;
+          const uint32_t now = millis();
+          id(camera_1_ha_last_ms) = now;
+          float t1 = fmaxf(id(camera_1_baseline) + id(camera_1_t1_offset), id(camera_1_t1_floor));
+          float t2 = fmaxf(id(camera_1_baseline) + id(camera_1_t2_offset), id(camera_1_t2_floor));
+          const bool motion_or_external = ((int32_t)(id(camera_1_motion_until)-now) > 0) || ((int32_t)(id(camera_1_external_level2_until)-now) > 0);
+          if (x < t1 - 6.0f) {
+            id(camera_1_baseline) = 0.98f * id(camera_1_baseline) + 0.02f * x;
+            id(camera_1_ambient_started_ms)=0; id(camera_1_ambient_nudge_ms)=0;
+            id(camera_1_ambient_candidate)=id(camera_1_ambient_min)=id(camera_1_ambient_max)=NAN;
+          } else if (!motion_or_external && x < t1 - 3.0f) {
+            if (id(camera_1_ambient_started_ms)==0 || isnan(id(camera_1_ambient_candidate))) {
+              id(camera_1_ambient_started_ms)=now; id(camera_1_ambient_nudge_ms)=now;
+              id(camera_1_ambient_candidate)=id(camera_1_ambient_min)=id(camera_1_ambient_max)=x;
+            } else {
+              id(camera_1_ambient_candidate)=0.90f*id(camera_1_ambient_candidate)+0.10f*x;
+              id(camera_1_ambient_min)=fminf(id(camera_1_ambient_min),x);
+              id(camera_1_ambient_max)=fmaxf(id(camera_1_ambient_max),x);
+              if (id(camera_1_ambient_max)-id(camera_1_ambient_min) > 4.0f) {
+                id(camera_1_ambient_started_ms)=now; id(camera_1_ambient_nudge_ms)=now;
+                id(camera_1_ambient_candidate)=id(camera_1_ambient_min)=id(camera_1_ambient_max)=x;
+              } else if ((uint32_t)(now-id(camera_1_ambient_started_ms)) >= 60000UL) {
+                const float max_step=fminf(1.0f, fmaxf(0.02f, (now-id(camera_1_ambient_nudge_ms))/30000.0f));
+                const float d=id(camera_1_ambient_candidate)-id(camera_1_baseline);
+                id(camera_1_baseline)+=fmaxf(-max_step,fminf(max_step,d));
+                id(camera_1_ambient_nudge_ms)=now;
+              }
+            }
+          } else {
+            id(camera_1_ambient_started_ms)=0; id(camera_1_ambient_nudge_ms)=0;
+            id(camera_1_ambient_candidate)=id(camera_1_ambient_min)=id(camera_1_ambient_max)=NAN;
+          }
+          if (!(id(monitor_power).state && id(active_camera_index) == 0)) {
+            id(camera_1_sound_gate) = false; id(camera_1_t1_started)=0; id(camera_1_t2_started)=0; return;
+          }
+          if (!id(camera_1_sound_gate)) {
+            if (x < t1 - 3.0f) id(camera_1_sound_gate) = true;
+            return;
+          }
+          if (x >= t2) {
+            if (id(camera_1_t2_started)==0) id(camera_1_t2_started)=now;
+            if ((uint32_t)(now-id(camera_1_t2_started)) >= id(alarm_t2_confirm_ms)) id(camera_1_sound2_until)=now+60000UL;
+          } else id(camera_1_t2_started)=0;
+          if (x >= t1) {
+            if (id(camera_1_t1_started)==0) id(camera_1_t1_started)=now;
+            if ((uint32_t)(now-id(camera_1_t1_started)) >= id(alarm_t1_confirm_ms)) id(camera_1_sound1_until)=now+20000UL;
+          } else id(camera_1_t1_started)=0;
+
+  - platform: homeassistant
+    id: camera_2_sound_level
+    entity_id: ${camera_2_sound_entity}
+    internal: true
+    on_value:
+      - lambda: |-
+          if (isnan(x)) return;
+          const uint32_t now = millis();
+          id(camera_2_ha_last_ms) = now;
+          float t1 = fmaxf(id(camera_2_baseline) + id(camera_2_t1_offset), id(camera_2_t1_floor));
+          float t2 = fmaxf(id(camera_2_baseline) + id(camera_2_t2_offset), id(camera_2_t2_floor));
+          const bool motion_or_external = ((int32_t)(id(camera_2_motion_until)-now) > 0) || ((int32_t)(id(camera_2_external_level2_until)-now) > 0);
+          if (x < t1 - 6.0f) {
+            id(camera_2_baseline) = 0.98f * id(camera_2_baseline) + 0.02f * x;
+            id(camera_2_ambient_started_ms)=0; id(camera_2_ambient_nudge_ms)=0;
+            id(camera_2_ambient_candidate)=id(camera_2_ambient_min)=id(camera_2_ambient_max)=NAN;
+          } else if (!motion_or_external && x < t1 - 3.0f) {
+            if (id(camera_2_ambient_started_ms)==0 || isnan(id(camera_2_ambient_candidate))) {
+              id(camera_2_ambient_started_ms)=now; id(camera_2_ambient_nudge_ms)=now;
+              id(camera_2_ambient_candidate)=id(camera_2_ambient_min)=id(camera_2_ambient_max)=x;
+            } else {
+              id(camera_2_ambient_candidate)=0.90f*id(camera_2_ambient_candidate)+0.10f*x;
+              id(camera_2_ambient_min)=fminf(id(camera_2_ambient_min),x);
+              id(camera_2_ambient_max)=fmaxf(id(camera_2_ambient_max),x);
+              if (id(camera_2_ambient_max)-id(camera_2_ambient_min) > 4.0f) {
+                id(camera_2_ambient_started_ms)=now; id(camera_2_ambient_nudge_ms)=now;
+                id(camera_2_ambient_candidate)=id(camera_2_ambient_min)=id(camera_2_ambient_max)=x;
+              } else if ((uint32_t)(now-id(camera_2_ambient_started_ms)) >= 60000UL) {
+                const float max_step=fminf(1.0f, fmaxf(0.02f, (now-id(camera_2_ambient_nudge_ms))/30000.0f));
+                const float d=id(camera_2_ambient_candidate)-id(camera_2_baseline);
+                id(camera_2_baseline)+=fmaxf(-max_step,fminf(max_step,d));
+                id(camera_2_ambient_nudge_ms)=now;
+              }
+            }
+          } else {
+            id(camera_2_ambient_started_ms)=0; id(camera_2_ambient_nudge_ms)=0;
+            id(camera_2_ambient_candidate)=id(camera_2_ambient_min)=id(camera_2_ambient_max)=NAN;
+          }
+          if (!(id(monitor_power).state && id(active_camera_index) == 1)) {
+            id(camera_2_sound_gate) = false; id(camera_2_t1_started)=0; id(camera_2_t2_started)=0; return;
+          }
+          if (!id(camera_2_sound_gate)) {
+            if (x < t1 - 3.0f) id(camera_2_sound_gate) = true;
+            return;
+          }
+          if (x >= t2) {
+            if (id(camera_2_t2_started)==0) id(camera_2_t2_started)=now;
+            if ((uint32_t)(now-id(camera_2_t2_started)) >= id(alarm_t2_confirm_ms)) id(camera_2_sound2_until)=now+60000UL;
+          } else id(camera_2_t2_started)=0;
+          if (x >= t1) {
+            if (id(camera_2_t1_started)==0) id(camera_2_t1_started)=now;
+            if ((uint32_t)(now-id(camera_2_t1_started)) >= id(alarm_t1_confirm_ms)) id(camera_2_sound1_until)=now+20000UL;
+          } else id(camera_2_t1_started)=0;
+
+  - platform: template
+    id: free_ram_diagnostic
+    name: "Free RAM"
+    icon: "mdi:memory"
+    unit_of_measurement: "kB"
+    device_class: data_size
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 1
+    update_interval: 5s
+    lambda: |-
+      return id(baby_monitor_media).get_free_heap_kb();
+
+  - platform: template
+    id: video_fps
+    name: "Video FPS"
+    icon: "mdi:video"
+    unit_of_measurement: "fps"
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 2
+    update_interval: 5s
+    lambda: |-
+      return id(baby_monitor_media).get_video_fps();
+
+  - platform: template
+    id: video_bitrate
+    name: "Video bitrate"
+    icon: "mdi:speedometer"
+    unit_of_measurement: "kbit/s"
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 1
+    update_interval: 5s
+    lambda: |-
+      return id(baby_monitor_media).get_video_bitrate_kbps();
+
+  - platform: template
+    id: video_drops
+    name: "Video drop"
+    icon: "mdi:video-off-outline"
+    unit_of_measurement: "frames"
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      return id(baby_monitor_media).get_video_drops();
+
+  - platform: template
+    id: video_replaced
+    name: "Video replace"
+    icon: "mdi:swap-horizontal"
+    unit_of_measurement: "frames"
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      return id(baby_monitor_media).get_video_replaced();
+
+  - platform: template
+    id: audio_bitrate
+    name: "Audio bitrate"
+    icon: "mdi:waveform"
+    unit_of_measurement: "kbit/s"
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 1
+    update_interval: 5s
+    lambda: |-
+      return id(baby_monitor_media).get_audio_bitrate_kbps();
+
+  - platform: template
+    id: audio_drops
+    name: "Audio drop"
+    icon: "mdi:volume-off"
+    unit_of_measurement: "frames"
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      return id(baby_monitor_media).get_audio_drops();
+
+
+  - platform: template
+    id: alarm_level_diag
+    name: "Alarm Level"
+    icon: "mdi:alarm-light"
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      return (float) id(active_alarm_level);
+
+  - platform: template
+    id: alarm_baseline_diag
+    name: "Alarm Baseline"
+    icon: "mdi:waveform"
+    unit_of_measurement: "dB"
+    entity_category: diagnostic
+    accuracy_decimals: 1
+    update_interval: 5s
+    lambda: |-
+      return id(active_alarm_baseline);
+
+  - platform: template
+    id: alarm_t1_diag
+    name: "Alarm T1"
+    icon: "mdi:volume-medium"
+    unit_of_measurement: "dB"
+    entity_category: diagnostic
+    accuracy_decimals: 1
+    update_interval: 5s
+    lambda: |-
+      return id(active_alarm_t1);
+
+  - platform: template
+    id: alarm_t2_diag
+    name: "Alarm T2"
+    icon: "mdi:volume-high"
+    unit_of_measurement: "dB"
+    entity_category: diagnostic
+    accuracy_decimals: 1
+    update_interval: 5s
+    lambda: |-
+      return id(active_alarm_t2);
+
+interval:
+  - interval: 250ms
+    then:
+      - lambda: |-
+          const uint32_t now = millis();
+          if (!id(monitor_power).state) {
+            if (id(active_alarm_level) != 0) { id(active_alarm_level)=0; id(baby_monitor_media).set_alarm_level(0); }
+            return;
+          }
+
+          if (id(night_mode).state && id(active_alarm_level) == 0 &&
+              id(night_wake_until) != 0 &&
+              (int32_t)(now - id(night_wake_until)) >= 0) {
+            id(night_wake_until) = 0;
+            id(backlight_output).turn_off();
+          }
+
+          const bool camera_1 = id(active_camera_index) == 0;
+          const uint32_t fresh = camera_1 ? id(camera_1_ha_last_ms) : id(camera_2_ha_last_ms);
+          if (fresh == 0 || (uint32_t)(now - fresh) > 30000UL) {
+            if (id(active_alarm_level) != 0) {
+              ESP_LOGW("alarm", "HA alarm feed stale >30s; clearing alarm");
+              id(active_alarm_level)=0; id(baby_monitor_media).set_alarm_level(0);
+            }
+            return;
+          }
+
+          uint32_t motion_until, s1_until, s2_until, external_level2_until;
+          float baseline, t1, t2;
+          if (camera_1) {
+            motion_until=id(camera_1_motion_until); s1_until=id(camera_1_sound1_until);
+            s2_until=id(camera_1_sound2_until); external_level2_until=id(camera_1_external_level2_until);
+            baseline=id(camera_1_baseline);
+            t1=fmaxf(baseline+id(camera_1_t1_offset), id(camera_1_t1_floor));
+            t2=fmaxf(baseline+id(camera_1_t2_offset), id(camera_1_t2_floor));
+          } else {
+            motion_until=id(camera_2_motion_until); s1_until=id(camera_2_sound1_until);
+            s2_until=id(camera_2_sound2_until); external_level2_until=id(camera_2_external_level2_until);
+            baseline=id(camera_2_baseline);
+            t1=fmaxf(baseline+id(camera_2_t1_offset), id(camera_2_t1_floor));
+            t2=fmaxf(baseline+id(camera_2_t2_offset), id(camera_2_t2_floor));
+          }
+          id(active_alarm_baseline)=baseline; id(active_alarm_t1)=t1; id(active_alarm_t2)=t2;
+
+          const bool motion = (int32_t)(motion_until - now) > 0;
+          const bool sound1 = (int32_t)(s1_until - now) > 0;
+          const bool sound2 = (int32_t)(s2_until - now) > 0;
+          const bool external_level2 = (int32_t)(external_level2_until - now) > 0;
+          int level = 0;
+          if (external_level2 || sound2 || (motion && sound1)) level = 2;
+          else if (motion || sound1) level = 1;
+
+          if (id(night_mode).state && level > 0) {
+            const uint32_t wake_ms = (uint32_t) lroundf(id(night_alarm_wake_seconds) * 1000.0f);
+            id(night_wake_until) = now + wake_ms;
+            id(backlight_output).turn_on();
+          }
+
+          if (level != id(active_alarm_level)) {
+            ESP_LOGI("alarm", "%s alarm %d -> %d (B=%.1f T1=%.1f T2=%.1f m=%d s=%d s2=%d ext2=%d)",
+                     camera_1 ? "Camera 1" : "Camera 2", id(active_alarm_level), level,
+                     baseline, t1, t2, motion, sound1, sound2, external_level2);
+
+            if (level > 0 && level > id(active_alarm_level)) {
+              std::string reason = camera_1 ? "Camera 1: " : "Camera 2: ";
+              if (external_level2) reason += "external level 2 event";
+              else if (sound2) reason += "sound T2";
+              else if (motion && sound1) reason += "motion + sound T1";
+              else if (sound1) reason += "sound T1";
+              else if (motion) reason += "motion";
+              else reason += "alarm";
+              id(last_alarm_reason).publish_state(reason);
+            }
+
+            id(active_alarm_level)=level;
+            id(baby_monitor_media).set_alarm_level((uint8_t)level);
+          }
