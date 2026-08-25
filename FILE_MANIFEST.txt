@@ -7,7 +7,6 @@ THIRD_PARTY_MODEL.md
 THIRD_PARTY_NOTICES.md
 baby_monitor.yaml
 components/baby_monitor/__init__.py
-components/baby_monitor/__pycache__/__init__.cpython-313.pyc
 components/baby_monitor/baby_monitor.cpp
 components/baby_monitor/baby_monitor.h
 components/baby_monitor/cry_detector.cpp
@@ -27,5 +26,4 @@ docs/licensing.md
 docs/ml-cry.md
 docs/troubleshooting.md
 secrets.example.yaml
-tools/__pycache__/fetch_cry_model.cpython-313.pyc
 tools/fetch_cry_model.py
