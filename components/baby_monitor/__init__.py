@@ -71,3 +71,6 @@ async def to_code(config):
         from esphome.components.esp32 import add_idf_component
         # Official Espressif decoder. The component uses the AAC API directly without an ADF pipeline.
         add_idf_component(name="espressif/esp_audio_codec", ref="2.6.2")
+
+        # v1.4.0: TensorFlow Lite Micro + ESP-NN kernels for local cry ML.
+        add_idf_component(name="espressif/esp-tflite-micro", ref="1.3.1")

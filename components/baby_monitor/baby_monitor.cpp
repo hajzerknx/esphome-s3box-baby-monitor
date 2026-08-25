@@ -37,9 +37,28 @@ static constexpr size_t MAX_INTERCHANGE_JPEG = 104 * 1024;
 static constexpr size_t VIDEO_WIDTH = 320;
 static constexpr size_t VIDEO_HEIGHT = 240;
 static constexpr size_t VIDEO_FRAMEBUFFER_BYTES = VIDEO_WIDTH * VIDEO_HEIGHT * 2;
+// v1.4.1-dev9: persistent internal/DMA staging buffer for LCD transfers.
+// The QVGA framebuffer remains in PSRAM; only 16 rows are copied at a time
+// into DMA-capable internal DRAM before draw_pixels_at().
+static constexpr size_t LCD_DMA_STAGE_ROWS = 16;
+static constexpr size_t LCD_DMA_STAGE_BYTES = VIDEO_WIDTH * LCD_DMA_STAGE_ROWS * 2;
+static constexpr size_t VIDEO_QUEUE_DEPTH = 1;
+static constexpr size_t AAC_PCM_MAX_BYTES = 16 * 1024;
+// dev9 safety reserve after esp_aac_dec_open(). Below these values the prior
+// dev7 run reached APIOverflowBuffer::enqueue_iov -> operator new[] -> abort.
+static constexpr size_t AAC_INTERNAL_GUARD_FREE_BYTES = 32 * 1024;
+static constexpr size_t AAC_INTERNAL_GUARD_LARGEST_BYTES = 16 * 1024;
+static constexpr size_t AAC_DMA_GUARD_FREE_BYTES = 24 * 1024;
+static constexpr size_t AAC_DMA_GUARD_LARGEST_BYTES = 8 * 1024;
+static constexpr size_t AUDIO_QUEUE_DEPTH = 8;
+static constexpr uint32_t AUDIO_WRITE_STALL_MS = 500;
+// v1.4.1-dev9: keep the proven stack capacities from dev8, but request only
+// the media-task stack storage from SPIRAM. The FreeRTOS TCB is always internal.
+static constexpr uint32_t AUDIO_TASK_STACK_BYTES = 16 * 1024;
+static constexpr uint32_t VIDEO_TASK_STACK_BYTES = 16 * 1024;
+static constexpr uint32_t RTSP_TASK_STACK_BYTES = 24 * 1024;
 
-// 320x240 RGB565 no-stream artwork, RLE encoded in flash.
-// Generated from the project placeholder artwork; no extra persistent PSRAM is used.
+// Private v1.0.0 visual variant: 320x240 RGB565 placeholder, RLE encoded.
 static const uint16_t NO_STREAM_PLACEHOLDER_RLE[] = {
   0x0002, 0x3186,
   0x000e, 0x31a6,
@@ -12402,14 +12421,10 @@ static const uint16_t NO_STREAM_PLACEHOLDER_RLE[] = {
   0x0005, 0x3186,
   0x0014, 0x31a6,
   0x000b, 0x3186,
-  0x0002, 0x31a6,
+  0x0002, 0x31a6
 };
-static constexpr size_t NO_STREAM_PLACEHOLDER_RLE_WORDS =
-    sizeof(NO_STREAM_PLACEHOLDER_RLE) / sizeof(NO_STREAM_PLACEHOLDER_RLE[0]);
-static constexpr size_t VIDEO_QUEUE_DEPTH = 1;
-static constexpr size_t AAC_PCM_INITIAL_BYTES = 4096;
-static constexpr size_t AUDIO_QUEUE_DEPTH = 6;
-static constexpr uint32_t AUDIO_WRITE_STALL_MS = 500;
+static constexpr size_t NO_STREAM_PLACEHOLDER_RLE_WORDS = sizeof(NO_STREAM_PLACEHOLDER_RLE)/sizeof(NO_STREAM_PLACEHOLDER_RLE[0]);
+
 
 class BitReader {
  public:
@@ -12438,7 +12453,6 @@ static const int JPEG_CHROMA_Q[64] = {
 static const uint8_t LUM_DC_LENS[] = {0,1,5,1,1,1,1,1,1,0,0,0,0,0,0,0};
 static const uint8_t LUM_DC_SYMS[] = {0,1,2,3,4,5,6,7,8,9,10,11};
 static const uint8_t LUM_AC_LENS[] = {0,2,1,3,3,2,4,3,5,5,4,4,0,0,1,0x7d};
-// Default JPEG reconstruction tables follow RFC 2435 / ITU-T T.81 conventions.
 static const uint8_t LUM_AC_SYMS[] = {
   0x01,0x02,0x03,0x00,0x04,0x11,0x05,0x12,0x21,0x31,0x41,0x06,0x13,0x51,0x61,0x07,
   0x22,0x71,0x14,0x32,0x81,0x91,0xa1,0x08,0x23,0x42,0xb1,0xc1,0x15,0x52,0xd1,0xf0,
@@ -12482,17 +12496,19 @@ std::string RtspResponse::header(const char *name) const {
 
 void BabyMonitor::setup() {
   // Production baseline: Home/touch only submit requests; a low-priority control task performs stop/start.
-  ESP_LOGI(TAG, "Baby Monitor external component v1.0.0");
-  ESP_LOGI(TAG, "Video: RTSP/RTP -> latest-frame queue -> JPEGDEC 1/2 -> QVGA RGB565 framebuffer -> single LCD flush");
+  ESP_LOGI(TAG, "Baby Monitor external component v1.0.0-private-placeholder");
+  ESP_LOGI(TAG, "Video: RTSP/RTP -> latest-frame queue -> JPEGDEC 1/2 -> QVGA RGB565 PSRAM framebuffer -> persistent DMA staging -> LCD");
   ESP_LOGI(TAG, "Audio: RTP MPEG4-GENERIC/AAC -> esp_audio_codec -> PCM16 mono 16kHz -> ES8311/I2S");
   ESP_LOGI(TAG, "Local control: GT911 Home/touch -> async control worker (no blocking in ESPHome main loop)");
   requested_camera_.store(active_camera_);
+  dev8_log_mem_stage_("setup-before-control");
   if (control_task_handle_ == nullptr) {
     if (xTaskCreatePinnedToCore(control_task_trampoline_, "baby_ctrl", 6144, this, 2, &control_task_handle_, 0) != pdPASS) {
       control_task_handle_ = nullptr;
       ESP_LOGE(TAG, "Cannot create control task");
     }
   }
+  dev8_log_mem_stage_("setup-after-control");
   if (speaker_ != nullptr) {
     speaker_->set_audio_stream_info(audio::AudioStreamInfo(16, 1, 16000));
   }
@@ -12512,11 +12528,9 @@ void BabyMonitor::set_camera_path(uint8_t i,const std::string &v){if(i<2)cameras
 float BabyMonitor::get_free_heap_kb() const { return (float) esp_get_free_heap_size()/1024.0f; }
 
 void BabyMonitor::set_audio_enabled(bool enabled) {
-  const bool old = audio_enabled_.exchange(enabled);
-  if (old == enabled) return;
-  // MUTE must not stop/start the ESPHome I2S speaker.
-  // Ask the audio task to drop queued/stale AAC and recreate only the AAC decoder.
-  audio_reset_requested_.store(true);
+  // v1.2.0: this flag controls local playback only. AAC decode must continue while
+  // muted because NoiseAnalyzer depends on source PCM for autonomous alarms.
+  audio_enabled_.store(enabled);
 }
 
 void BabyMonitor::reset_diagnostics_() {
@@ -12533,6 +12547,7 @@ void BabyMonitor::set_enabled(bool enabled) {
   const bool previous = enabled_.exchange(enabled);
   if (previous == enabled) return;
   ESP_LOGI(TAG, "Monitor request: %s", enabled ? "ON" : "OFF");
+  if (!enabled) { motion_detector_.reset(); cry_detector_.reset(); }
   if (control_task_handle_ != nullptr) {
     xTaskNotifyGive(control_task_handle_);
   } else {
@@ -12546,6 +12561,8 @@ void BabyMonitor::set_camera(uint8_t index) {
   const uint8_t previous = requested_camera_.exchange(index);
   if (previous == index && active_camera_ == index) return;
   ESP_LOGI(TAG, "Camera request: %s -> %s", cameras_[active_camera_].name.c_str(), cameras_[index].name.c_str());
+  cry_detector_.reset();
+  motion_detector_.reset();
   if (control_task_handle_ != nullptr) {
     xTaskNotifyGive(control_task_handle_);
   } else {
@@ -12579,10 +12596,9 @@ void BabyMonitor::release_media_resources_() {
   // Keep the 320x240 RGB565 framebuffer allocated across media restarts.
   // It is also the canvas for the no-stream placeholder, and retaining it avoids
   // stale-camera pixels plus repeated 150 kB PSRAM alloc/free cycles on switches.
-  if (jpeg_decoder_ != nullptr) {
-    delete jpeg_decoder_;
-    jpeg_decoder_ = nullptr;
-  }
+  // v1.4.0-dev46: keep JPEGDEC alive across media/camera restarts.
+  // It is tiny compared with frame buffers, and retaining it eliminates the
+  // dynamic first-frame allocation that raced TFLM initialization in dev12.
   if (!audio_task_running_.load()) close_aac_decoder_();
 }
 
@@ -12590,7 +12606,18 @@ void BabyMonitor::start_session_() {
   if (!enabled_.load()) return;
   reset_diagnostics_();
   placeholder_due_ms_.store(0);
+  dev8_log_mem_stage_("session-enter");
+
+  // v1.4.1-dev9: reserve the LCD staging buffer before placeholder rendering,
+  // Cry ML runtime initialization and media task creation. Keeping this block
+  // permanently allocated prevents per-frame DMA-capable heap allocation.
+  if (!ensure_lcd_dma_stage_()) {
+    ESP_LOGE(TAG, "v1.4.1-dev9 LCD DMA staging unavailable; refusing media start");
+    return;
+  }
+  dev8_log_mem_stage_("lcd-stage-ready");
   render_no_stream_placeholder_();
+  dev8_log_mem_stage_("placeholder-ready");
   if (task_running_.load() || audio_task_running_.load() || video_task_running_.load()) {
     ESP_LOGW(TAG, "Media tasks still running; refusing duplicate start");
     return;
@@ -12614,35 +12641,116 @@ void BabyMonitor::start_session_() {
   xQueueReset(audio_queue_);
   xQueueReset(video_queue_);
   video_busy_slot_.store(-1);
+  dev8_log_mem_stage_("queues-ready");
+
+  // v1.4.0-dev46: serialize the two initialization paths that overlapped in
+  // dev12. First create the persistent JPEGDEC object without global operator
+  // new, then execute the one-shot TFLM preflight. Only after both complete do
+  // we create baby_audio/baby_video/baby_rtsp. ML failure is intentionally
+  // non-fatal: the monitor continues with Cry ML in shadow/error state.
+  if (!ensure_jpeg_decoder_()) {
+    ESP_LOGE(TAG, "dev46 preflight: JPEGDEC unavailable; refusing media start");
+    return;
+  }
+  dev8_log_mem_stage_("jpegdec-ready");
+
+  ESP_LOGI(TAG, "dev46 preflight: JPEGDEC ready; starting serialized Cry ML runtime init");
+  const bool cry_ready = cry_detector_.prepare_runtime();
+  ESP_LOGI(TAG, "dev46 preflight: Cry ML init complete ready=%s status=%s; starting media tasks",
+           YESNO(cry_ready), cry_detector_.status());
+  dev8_log_mem_stage_("cry-runtime-ready");
 
   audio_task_running_.store(true);
-  if (xTaskCreatePinnedToCore(audio_task_trampoline_, "baby_audio", 16384, this, 5, &audio_task_handle_, 1) != pdPASS) {
+  dev8_log_mem_stage_("audio-task-before");
+  if (!create_media_task_psram_(audio_task_trampoline_, "baby_audio", AUDIO_TASK_STACK_BYTES, 5,
+                                &audio_task_handle_, 1, audio_task_psram_stack_)) {
     audio_task_running_.store(false);
     audio_task_handle_ = nullptr;
     ESP_LOGE(TAG, "Cannot create audio task");
     return;
   }
+  dev8_log_mem_stage_("audio-task-created");
 
   video_task_running_.store(true);
-  if (xTaskCreatePinnedToCore(video_task_trampoline_, "baby_video", 16384, this, 3, &video_task_handle_, 1) != pdPASS) {
+  dev8_log_mem_stage_("video-task-before");
+  if (!create_media_task_psram_(video_task_trampoline_, "baby_video", VIDEO_TASK_STACK_BYTES, 3,
+                                &video_task_handle_, 1, video_task_psram_stack_)) {
     video_task_running_.store(false);
     video_task_handle_ = nullptr;
     stop_requested_.store(true);
     ESP_LOGE(TAG, "Cannot create video task");
     return;
   }
+  dev8_log_mem_stage_("video-task-created");
 
   task_running_.store(true);
-  if (xTaskCreatePinnedToCore(rtsp_task_trampoline_, "baby_rtsp", 24576, this, 4, &rtsp_task_handle_, 0) != pdPASS) {
+  dev8_log_mem_stage_("rtsp-task-before");
+  if (!create_media_task_psram_(rtsp_task_trampoline_, "baby_rtsp", RTSP_TASK_STACK_BYTES, 4,
+                                &rtsp_task_handle_, 0, rtsp_task_psram_stack_)) {
     task_running_.store(false);
     rtsp_task_handle_ = nullptr;
     stop_requested_.store(true);
     ESP_LOGE(TAG, "Cannot create RTSP task");
+  } else {
+    dev8_log_mem_stage_("rtsp-task-created");
   }
+}
+
+bool BabyMonitor::create_media_task_psram_(TaskFunction_t fn, const char *name, uint32_t stack_bytes,
+                                                UBaseType_t priority, TaskHandle_t *handle, BaseType_t core,
+                                                std::atomic<bool> &psram_flag) {
+  psram_flag.store(false);
+  if (handle == nullptr) return false;
+  *handle = nullptr;
+
+  const uint32_t int_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const uint32_t int_largest_before = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const uint32_t psram_before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+
+  const BaseType_t psram_result = xTaskCreatePinnedToCoreWithCaps(
+      fn, name, stack_bytes, this, priority, handle, core, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (psram_result == pdPASS && *handle != nullptr) {
+    psram_flag.store(true);
+    ESP_LOGI(TAG,
+             "v1.4.1-dev9 TASK_STACK: task=%s result=PSRAM bytes=%u core=%d prio=%u int=%u->%uB int_largest=%u->%uB psram=%u->%uB",
+             name, (unsigned) stack_bytes, (int) core, (unsigned) priority,
+             (unsigned) int_before,
+             (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned) int_largest_before,
+             (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned) psram_before,
+             (unsigned) heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    return true;
+  }
+
+  // Do not make monitor start dependent on the experimental placement. If the
+  // external-stack allocation is unavailable, preserve dev8 semantics and make
+  // that fact explicit in diagnostics.
+  *handle = nullptr;
+  const BaseType_t fallback_result = xTaskCreatePinnedToCore(
+      fn, name, stack_bytes, this, priority, handle, core);
+  if (fallback_result == pdPASS && *handle != nullptr) {
+    ESP_LOGW(TAG,
+             "v1.4.1-dev9 TASK_STACK: task=%s result=INTERNAL_FALLBACK bytes=%u core=%d prio=%u psram_create=%d int=%uB int_largest=%uB psram=%uB",
+             name, (unsigned) stack_bytes, (int) core, (unsigned) priority, (int) psram_result,
+             (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned) heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    return true;
+  }
+
+  ESP_LOGE(TAG,
+           "v1.4.1-dev9 TASK_STACK: task=%s result=FAIL bytes=%u psram_create=%d fallback=%d int=%uB int_largest=%uB psram=%uB",
+           name, (unsigned) stack_bytes, (int) psram_result, (int) fallback_result,
+           (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+           (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+           (unsigned) heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+  return false;
 }
 
 void BabyMonitor::stop_session_() {
   reset_diagnostics_();
+  noise_analyzer_.reset();
   stop_requested_.store(true);
   media_epoch_.fetch_add(1);
   request_audio_reset_();
@@ -12717,32 +12825,45 @@ void BabyMonitor::control_task_() {
 void BabyMonitor::rtsp_task_trampoline_(void *arg) {
   auto *self = static_cast<BabyMonitor *>(arg);
   self->rtsp_task_();
+  const bool psram_stack = self->rtsp_task_psram_stack_.exchange(false);
   self->rtsp_task_handle_ = nullptr;
   self->task_running_.store(false);
-  ESP_LOGI(TAG, "RTSP task stopped");
-  vTaskDelete(nullptr);
+  ESP_LOGI(TAG, "RTSP task stopped; stack=%s", psram_stack ? "PSRAM" : "internal");
+  if (psram_stack)
+    vTaskDeleteWithCaps(nullptr);
+  else
+    vTaskDelete(nullptr);
 }
 
 void BabyMonitor::audio_task_trampoline_(void *arg) {
   auto *self = static_cast<BabyMonitor *>(arg);
   self->audio_task_();
+  const bool psram_stack = self->audio_task_psram_stack_.exchange(false);
   self->audio_task_handle_ = nullptr;
   self->audio_task_running_.store(false);
-  ESP_LOGI(TAG, "Audio task stopped");
-  vTaskDelete(nullptr);
+  ESP_LOGI(TAG, "Audio task stopped; stack=%s", psram_stack ? "PSRAM" : "internal");
+  if (psram_stack)
+    vTaskDeleteWithCaps(nullptr);
+  else
+    vTaskDelete(nullptr);
 }
 
 void BabyMonitor::video_task_trampoline_(void *arg) {
   auto *self = static_cast<BabyMonitor *>(arg);
   self->video_task_();
+  const bool psram_stack = self->video_task_psram_stack_.exchange(false);
   self->video_task_handle_ = nullptr;
   self->video_task_running_.store(false);
-  ESP_LOGI(TAG, "Video task stopped");
-  vTaskDelete(nullptr);
+  ESP_LOGI(TAG, "Video task stopped; stack=%s", psram_stack ? "PSRAM" : "internal");
+  if (psram_stack)
+    vTaskDeleteWithCaps(nullptr);
+  else
+    vTaskDelete(nullptr);
 }
 
 void BabyMonitor::audio_task_() {
   ESP_LOGI(TAG, "Audio task started on core %d", xPortGetCoreID());
+  dev8_log_mem_stage_("audio-task-entry");
   AudioAu au{};
   uint32_t local_epoch = 0;
   bool speaker_started = false;
@@ -12755,6 +12876,7 @@ void BabyMonitor::audio_task_() {
     speaker_->start();
     speaker_started = true;
   }
+  dev8_log_mem_stage_("speaker-started");
 
   while (enabled_.load() && !stop_requested_.load()) {
     if (audio_reset_requested_.exchange(false)) {
@@ -12765,14 +12887,29 @@ void BabyMonitor::audio_task_() {
 
     if (audio_queue_ == nullptr) break;
     if (xQueueReceive(audio_queue_, &au, pdMS_TO_TICKS(100)) != pdTRUE) continue;
+
+    // v1.4.2-dev2: observe queue residence and consumer scheduling without
+    // altering the queue, priorities or decode path. esp_timer_get_time() is
+    // monotonic; uint32 subtraction is intentionally wrap-safe.
+    const uint32_t dequeue_us = static_cast<uint32_t>(esp_timer_get_time());
+    if (au.enqueue_us != 0) {
+      const uint32_t wait_us = dequeue_us - au.enqueue_us;
+      audio_flow_wait_us_total_.fetch_add(wait_us, std::memory_order_relaxed);
+      audio_flow_wait_count_.fetch_add(1, std::memory_order_relaxed);
+      uint32_t prev = audio_flow_wait_us_max_.load(std::memory_order_relaxed);
+      while (wait_us > prev && !audio_flow_wait_us_max_.compare_exchange_weak(prev, wait_us, std::memory_order_relaxed)) {}
+    }
+    if (audio_flow_last_dequeue_us_ != 0) {
+      const uint32_t gap_us = dequeue_us - audio_flow_last_dequeue_us_;
+      uint32_t prev = audio_flow_consumer_gap_max_us_.load(std::memory_order_relaxed);
+      while (gap_us > prev && !audio_flow_consumer_gap_max_us_.compare_exchange_weak(prev, gap_us, std::memory_order_relaxed)) {}
+    }
+    audio_flow_last_dequeue_us_ = dequeue_us;
+
     if (au.length == 0) continue;
 
-    // Muted: consume/drop newest AU without touching speaker lifecycle.
-    if (!audio_enabled_.load()) {
-      close_aac_decoder_();
-      local_epoch = au.epoch;
-      continue;
-    }
+    // v1.2.0: even while local playback is muted we still decode AAC so the
+    // NoiseAnalyzer keeps receiving source PCM. MUTE gates only speaker output.
 
     if (au.epoch != local_epoch) {
       close_aac_decoder_();
@@ -12793,6 +12930,7 @@ void BabyMonitor::audio_task_() {
 
 void BabyMonitor::video_task_() {
   ESP_LOGI(TAG, "Video task started on core %d", xPortGetCoreID());
+  dev8_log_mem_stage_("video-task-entry");
   VideoFrame frame{};
 
   while (enabled_.load() && !stop_requested_.load()) {
@@ -12847,6 +12985,7 @@ void BabyMonitor::video_task_() {
 }
 
 void BabyMonitor::rtsp_task_() {
+  dev8_log_mem_stage_("rtsp-task-entry");
   uint32_t retry_ms = RTSP_RETRY_INITIAL_MS;
 
   while (enabled_.load() && !stop_requested_.load()) {
@@ -12869,6 +13008,8 @@ void BabyMonitor::rtsp_task_() {
     decoded_frames_.store(0); dropped_frames_.store(0); video_replaced_frames_.store(0); jpeg_state_ = JpegFrameState{};
     audio_aus_ = 0; audio_decoded_aus_.store(0); audio_dropped_aus_.store(0);
     video_decode_us_total_.store(0); video_decode_count_.store(0); video_decode_us_max_.store(0);
+    dev4_reset_spi_diag_();
+    dev5_spi_err101_window_.store(0, std::memory_order_relaxed);
     audio_decode_us_total_.store(0); audio_decode_count_.store(0); audio_decode_us_max_.store(0);
     aac_rtp_supported_ = false;
     session_media_packets_ = 0;
@@ -12970,6 +13111,29 @@ void BabyMonitor::receive_interleaved_loop_(){std::vector<uint8_t> p;p.reserve(2
     uint32_t aok = audio_decoded_aus_.exchange(0);
     uint32_t adrop = audio_dropped_aus_.exchange(0);
     uint32_t aavg = acount ? (uint32_t) (atotal / acount) : 0;
+    const uint32_t apipe_count = audio_pipe_count_.exchange(0, std::memory_order_relaxed);
+    const uint64_t anoise_total = audio_pipe_noise_us_total_.exchange(0, std::memory_order_relaxed);
+    const uint64_t acry_total = audio_pipe_cry_us_total_.exchange(0, std::memory_order_relaxed);
+    const uint64_t aplay_total = audio_pipe_play_us_total_.exchange(0, std::memory_order_relaxed);
+    const uint64_t apipe_total = audio_pipe_total_us_total_.exchange(0, std::memory_order_relaxed);
+    const uint32_t anoise_max = audio_pipe_noise_us_max_.exchange(0, std::memory_order_relaxed);
+    const uint32_t acry_max = audio_pipe_cry_us_max_.exchange(0, std::memory_order_relaxed);
+    const uint32_t aplay_max = audio_pipe_play_us_max_.exchange(0, std::memory_order_relaxed);
+    const uint32_t apipe_max = audio_pipe_total_us_max_.exchange(0, std::memory_order_relaxed);
+    const uint32_t aq_peak = audio_pipe_queue_peak_.exchange(0, std::memory_order_relaxed);
+    const uint32_t aflow_gap_min_raw = audio_flow_enq_gap_min_us_.exchange(UINT32_MAX, std::memory_order_relaxed);
+    const uint32_t aflow_gap_max = audio_flow_enq_gap_max_us_.exchange(0, std::memory_order_relaxed);
+    const uint32_t aflow_burst_max = audio_flow_burst_max_.exchange(0, std::memory_order_relaxed);
+    const uint64_t aflow_wait_total = audio_flow_wait_us_total_.exchange(0, std::memory_order_relaxed);
+    const uint32_t aflow_wait_max = audio_flow_wait_us_max_.exchange(0, std::memory_order_relaxed);
+    const uint32_t aflow_wait_count = audio_flow_wait_count_.exchange(0, std::memory_order_relaxed);
+    const uint32_t aflow_consumer_gap_max = audio_flow_consumer_gap_max_us_.exchange(0, std::memory_order_relaxed);
+    const uint32_t aflow_gap_min = aflow_gap_min_raw == UINT32_MAX ? 0U : aflow_gap_min_raw;
+    const uint32_t aflow_wait_avg = aflow_wait_count ? static_cast<uint32_t>(aflow_wait_total / aflow_wait_count) : 0U;
+    const uint32_t anoise_avg = apipe_count ? static_cast<uint32_t>(anoise_total / apipe_count) : 0U;
+    const uint32_t acry_avg = apipe_count ? static_cast<uint32_t>(acry_total / apipe_count) : 0U;
+    const uint32_t aplay_avg = apipe_count ? static_cast<uint32_t>(aplay_total / apipe_count) : 0U;
+    const uint32_t apipe_avg = apipe_count ? static_cast<uint32_t>(apipe_total / apipe_count) : 0U;
     const uint32_t stats_elapsed_ms = now - last_stats_ms_;
     if (stats_elapsed_ms > 0) {
       diagnostics_video_fps_x100_.store((uint32_t) (((uint64_t) vframes * 100000ULL) / stats_elapsed_ms));
@@ -12995,6 +13159,24 @@ void BabyMonitor::receive_interleaved_loop_(){std::vector<uint8_t> p;p.reserve(2
       get_free_heap_kb(),(unsigned) uxTaskGetStackHighWaterMark(nullptr),
       video_task_handle_ ? (unsigned) uxTaskGetStackHighWaterMark(video_task_handle_) : 0U,
       audio_task_handle_ ? (unsigned) uxTaskGetStackHighWaterMark(audio_task_handle_) : 0U);
+    ESP_LOGI(TAG,
+             "v1.5.0 AUDIO_PIPE: n=%u decode=%u/%uus noise=%u/%uus cry=%u/%uus play=%u/%uus total=%u/%uus q_peak=%u/%u",
+             (unsigned) apipe_count, (unsigned) aavg, (unsigned) amax,
+             (unsigned) anoise_avg, (unsigned) anoise_max,
+             (unsigned) acry_avg, (unsigned) acry_max,
+             (unsigned) aplay_avg, (unsigned) aplay_max,
+             (unsigned) apipe_avg, (unsigned) apipe_max,
+             (unsigned) aq_peak, (unsigned) AUDIO_QUEUE_DEPTH);
+    ESP_LOGI(TAG,
+             "v1.5.0 AAC_FLOW: enq_gap=%u/%uus burst10=%u wait=%u/%uus consumer_gap_max=%uus q_peak=%u/%u",
+             (unsigned) aflow_gap_min, (unsigned) aflow_gap_max,
+             (unsigned) aflow_burst_max, (unsigned) aflow_wait_avg,
+             (unsigned) aflow_wait_max, (unsigned) aflow_consumer_gap_max,
+             (unsigned) aq_peak, (unsigned) AUDIO_QUEUE_DEPTH);
+    dev4_log_spi_diag_();
+    // Keep timestamps across the reporting boundary, but make burst length
+    // strictly local to the next 5 s diagnostic window.
+    audio_flow_current_burst_ = 0;
     video_packets_=audio_packets_=0;video_bytes_=audio_bytes_=0;audio_aus_=0;last_stats_ms_=now;}}
 }
 
@@ -13026,20 +13208,125 @@ void BabyMonitor::configure_aac_from_sdp_(const SdpTrack &audio) {
 
 bool BabyMonitor::ensure_aac_decoder_() {
   if (aac_decoder_ != nullptr) return true;
+
+  const uint32_t now = millis();
+  if (aac_next_open_retry_ms_ != 0 && (int32_t) (now - aac_next_open_retry_ms_) < 0) return false;
+
+  const uint32_t attempt = ++aac_open_attempts_;
+  dev8_log_aac_heap_("runtime-before", 0, attempt);
+
   esp_aac_dec_cfg_t cfg{};
   cfg.sample_rate = 16000;
   cfg.channel = 1;
   cfg.bits_per_sample = 16;
   cfg.no_adts_header = true;
   cfg.aac_plus_enable = false;
+
+  const int64_t begin_us = esp_timer_get_time();
   esp_audio_err_t ret = esp_aac_dec_open(&cfg, sizeof(cfg), &aac_decoder_);
+  const uint32_t elapsed_us = (uint32_t) (esp_timer_get_time() - begin_us);
+
   if (ret != ESP_AUDIO_ERR_OK || aac_decoder_ == nullptr) {
-    ESP_LOGE(TAG, "AAC decoder open failed: %d; heap=%.1f kB", (int) ret, get_free_heap_kb());
     aac_decoder_ = nullptr;
+    const uint32_t failures = ++aac_open_failures_;
+    aac_next_open_retry_ms_ = now + 3000U;
+    dev8_log_aac_heap_("runtime-fail", (int) ret, attempt);
+    ESP_LOGE(TAG,
+             "v1.4.1-dev9 AAC_OPEN: phase=runtime result=FAIL ret=%d attempt=%u failures=%u elapsed=%uus retry=3000ms",
+             (int) ret, (unsigned) attempt, (unsigned) failures, (unsigned) elapsed_us);
     return false;
   }
-  aac_pcm_.resize(AAC_PCM_INITIAL_BYTES);
-  ESP_LOGI(TAG, "AAC decoder ready; heap=%.1f kB", get_free_heap_kb());
+
+  // dev8: capture the decoder's real internal/DMA footprint before allocating
+  // any PCM output buffer. If the decoder leaves too little reserve for the
+  // ESPHome API/SPI/Wi-Fi, close it immediately instead of allowing a later
+  // operator new[] failure to abort the whole device.
+  dev8_log_aac_heap_("runtime-opened", (int) ret, attempt);
+  const uint32_t int_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const uint32_t int_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const uint32_t dma_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+  const uint32_t dma_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+  if (int_free < AAC_INTERNAL_GUARD_FREE_BYTES || int_largest < AAC_INTERNAL_GUARD_LARGEST_BYTES ||
+      dma_free < AAC_DMA_GUARD_FREE_BYTES || dma_largest < AAC_DMA_GUARD_LARGEST_BYTES) {
+    ESP_LOGW(TAG,
+             "v1.4.1-dev9 AAC_GUARD: result=REJECT attempt=%u int=%u/%uB dma=%u/%uB thresholds int=%u/%uB dma=%u/%uB",
+             (unsigned) attempt, (unsigned) int_free, (unsigned) int_largest,
+             (unsigned) dma_free, (unsigned) dma_largest,
+             (unsigned) AAC_INTERNAL_GUARD_FREE_BYTES, (unsigned) AAC_INTERNAL_GUARD_LARGEST_BYTES,
+             (unsigned) AAC_DMA_GUARD_FREE_BYTES, (unsigned) AAC_DMA_GUARD_LARGEST_BYTES);
+    esp_aac_dec_close(aac_decoder_);
+    aac_decoder_ = nullptr;
+    aac_next_open_retry_ms_ = now + 5000U;
+    dev8_log_aac_heap_("runtime-guard-closed", (int) ret, attempt);
+    return false;
+  }
+
+  if (!ensure_aac_pcm_psram_()) {
+    ESP_LOGE(TAG, "v1.4.1-dev9 AAC_OPEN: PCM PSRAM allocation failed; closing decoder");
+    esp_aac_dec_close(aac_decoder_);
+    aac_decoder_ = nullptr;
+    aac_next_open_retry_ms_ = now + 5000U;
+    dev8_log_aac_heap_("runtime-pcm-fail", (int) ret, attempt);
+    return false;
+  }
+
+  aac_next_open_retry_ms_ = 0;
+  dev8_log_aac_heap_("runtime-ok", (int) ret, attempt);
+  ESP_LOGI(TAG,
+           "v1.4.1-dev9 AAC_OPEN: phase=runtime result=OK attempt=%u elapsed=%uus pcm=%uB region=PSRAM",
+           (unsigned) attempt, (unsigned) elapsed_us, (unsigned) aac_pcm_capacity_);
+  return true;
+}
+
+void BabyMonitor::dev8_log_aac_heap_(const char *phase, int ret, uint32_t attempt) const {
+  const uint32_t int_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+  const uint32_t dma_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA;
+  ESP_LOGI(TAG,
+           "v1.4.1-dev9 AAC_MEM: phase=%s ret=%d attempt=%u int=%uB int_largest=%uB "
+           "dma=%uB dma_largest=%uB 8bit=%uB 8bit_largest=%uB 32bit=%uB 32bit_largest=%uB psram=%uB psram_largest=%uB stack=%uB",
+           phase, ret, (unsigned) attempt,
+           (unsigned) heap_caps_get_free_size(int_caps),
+           (unsigned) heap_caps_get_largest_free_block(int_caps),
+           (unsigned) heap_caps_get_free_size(dma_caps),
+           (unsigned) heap_caps_get_largest_free_block(dma_caps),
+           (unsigned) heap_caps_get_free_size(MALLOC_CAP_8BIT),
+           (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+           (unsigned) heap_caps_get_free_size(MALLOC_CAP_32BIT),
+           (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_32BIT),
+           (unsigned) heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+           (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
+           (unsigned) uxTaskGetStackHighWaterMark(nullptr));
+}
+
+void BabyMonitor::dev8_log_mem_stage_(const char *phase) const {
+  const uint32_t int_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+  const uint32_t dma_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA;
+  const uint32_t self_stack = uxTaskGetStackHighWaterMark(nullptr);
+  ESP_LOGI(TAG,
+           "v1.4.1-dev9 MEM_STAGE: phase=%s core=%d task=%s int=%uB int_largest=%uB dma=%uB dma_largest=%uB "
+           "psram=%uB psram_largest=%uB self_stack=%uB",
+           phase, xPortGetCoreID(), pcTaskGetName(nullptr),
+           (unsigned) heap_caps_get_free_size(int_caps),
+           (unsigned) heap_caps_get_largest_free_block(int_caps),
+           (unsigned) heap_caps_get_free_size(dma_caps),
+           (unsigned) heap_caps_get_largest_free_block(dma_caps),
+           (unsigned) heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+           (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
+           (unsigned) self_stack);
+}
+
+bool BabyMonitor::ensure_aac_pcm_psram_() {
+  if (aac_pcm_ != nullptr && aac_pcm_capacity_ >= AAC_PCM_MAX_BYTES) return true;
+  if (aac_pcm_ != nullptr) {
+    heap_caps_free(aac_pcm_);
+    aac_pcm_ = nullptr;
+    aac_pcm_capacity_ = 0;
+  }
+  aac_pcm_ = static_cast<uint8_t *>(heap_caps_malloc(AAC_PCM_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (aac_pcm_ == nullptr) return false;
+  aac_pcm_capacity_ = AAC_PCM_MAX_BYTES;
+  ESP_LOGI(TAG, "v1.4.1-dev9 AAC_PCM: ready=%uB region=PSRAM ptr=%p",
+           (unsigned) aac_pcm_capacity_, aac_pcm_);
   return true;
 }
 
@@ -13048,22 +13335,22 @@ void BabyMonitor::close_aac_decoder_() {
     esp_aac_dec_close(aac_decoder_);
     aac_decoder_ = nullptr;
   }
-  aac_pcm_.clear();
-  aac_pcm_.shrink_to_fit();
+  // dev8: keep the fixed PSRAM PCM buffer across RTSP/AAC reconnects.
+  // This avoids internal-heap vector reallocations and PSRAM fragmentation.
 }
 
 bool BabyMonitor::decode_aac_au_(const uint8_t *data, size_t length) {
+  const int64_t pipe_start_us = esp_timer_get_time();
   if (!enabled_.load() || stop_requested_.load() || speaker_ == nullptr || !ensure_aac_decoder_()) return false;
   esp_audio_dec_in_raw_t raw{}; raw.buffer = const_cast<uint8_t *>(data); raw.len = length;
-  esp_audio_dec_out_frame_t out{}; out.buffer = aac_pcm_.data(); out.len = aac_pcm_.size();
+  esp_audio_dec_out_frame_t out{}; out.buffer = aac_pcm_; out.len = aac_pcm_capacity_;
   esp_audio_dec_info_t info{};
   int64_t start_us = esp_timer_get_time();
   esp_audio_err_t ret = esp_aac_dec_decode(aac_decoder_, &raw, &out, &info);
-  if (ret == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH && out.needed_size > 0 && out.needed_size <= 16384) {
-    aac_pcm_.resize(out.needed_size);
-    raw.buffer = const_cast<uint8_t *>(data); raw.len = length; raw.consumed = 0;
-    out = {}; out.buffer = aac_pcm_.data(); out.len = aac_pcm_.size();
-    ret = esp_aac_dec_decode(aac_decoder_, &raw, &out, &info);
+  if (ret == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH && out.needed_size > aac_pcm_capacity_) {
+    ESP_LOGE(TAG, "AAC PCM output exceeds fixed PSRAM buffer: needed=%u capacity=%u",
+             (unsigned) out.needed_size, (unsigned) aac_pcm_capacity_);
+    return false;
   }
   uint32_t elapsed = (uint32_t) (esp_timer_get_time() - start_us);
   audio_decode_us_total_.fetch_add(elapsed);
@@ -13079,46 +13366,103 @@ bool BabyMonitor::decode_aac_au_(const uint8_t *data, size_t length) {
     ESP_LOGW(TAG, "Unexpected AAC output: %u Hz, %u ch, %u bit", (unsigned) info.sample_rate, info.channel, info.bits_per_sample);
     return false;
   }
-  // Software volume. Never call speaker_->set_volume() from baby_audio.
-  // AAC decoder outputs signed PCM16 mono. Scale in-place before sending to I2S.
-  const float volume = audio_volume_.load();
-  if (volume < 0.999f) {
-    int16_t *samples = reinterpret_cast<int16_t *>(out.buffer);
-    const size_t sample_count = out.decoded_size / sizeof(int16_t);
-    if (volume <= 0.001f) {
-      memset(samples, 0, sample_count * sizeof(int16_t));
-    } else {
-      for (size_t i = 0; i < sample_count; i++)
-        samples[i] = static_cast<int16_t>(static_cast<float>(samples[i]) * volume);
+
+  const int16_t *source_samples = reinterpret_cast<const int16_t *>(out.buffer);
+  const size_t source_sample_count = out.decoded_size / sizeof(int16_t);
+
+  const int64_t noise_start_us = esp_timer_get_time();
+  noise_analyzer_.process(source_samples, source_sample_count, info.sample_rate);
+  const uint32_t noise_us = static_cast<uint32_t>(esp_timer_get_time() - noise_start_us);
+  audio_pipe_noise_us_total_.fetch_add(noise_us, std::memory_order_relaxed);
+  prev_max = audio_pipe_noise_us_max_.load(std::memory_order_relaxed);
+  while (noise_us > prev_max && !audio_pipe_noise_us_max_.compare_exchange_weak(prev_max, noise_us, std::memory_order_relaxed)) {}
+
+  const int64_t cry_start_us = esp_timer_get_time();
+  cry_detector_.feed(source_samples, source_sample_count, info.sample_rate);
+  const uint32_t cry_us = static_cast<uint32_t>(esp_timer_get_time() - cry_start_us);
+  audio_pipe_cry_us_total_.fetch_add(cry_us, std::memory_order_relaxed);
+  prev_max = audio_pipe_cry_us_max_.load(std::memory_order_relaxed);
+  while (cry_us > prev_max && !audio_pipe_cry_us_max_.compare_exchange_weak(prev_max, cry_us, std::memory_order_relaxed)) {}
+
+  uint32_t play_us = 0;
+  if (audio_enabled_.load()) {
+    const int64_t play_start_us = esp_timer_get_time();
+    const float volume = audio_volume_.load();
+    if (volume < 0.999f) {
+      int16_t *samples = reinterpret_cast<int16_t *>(out.buffer);
+      const size_t sample_count = out.decoded_size / sizeof(int16_t);
+      if (volume <= 0.001f) {
+        memset(samples, 0, sample_count * sizeof(int16_t));
+      } else {
+        for (size_t i = 0; i < sample_count; i++)
+          samples[i] = static_cast<int16_t>(static_cast<float>(samples[i]) * volume);
+      }
     }
+
+    size_t offset = 0;
+    int64_t stall_start = esp_timer_get_time();
+    while (offset < out.decoded_size && enabled_.load() && audio_enabled_.load() && !stop_requested_.load()) {
+      size_t written = speaker_->play(out.buffer + offset, out.decoded_size - offset, pdMS_TO_TICKS(100));
+      if (written > 0) {
+        offset += written;
+        stall_start = esp_timer_get_time();
+        continue;
+      }
+      if ((esp_timer_get_time() - stall_start) / 1000 > AUDIO_WRITE_STALL_MS) {
+        ESP_LOGW(TAG, "Speaker stalled: wrote %u/%u B", (unsigned) offset, (unsigned) out.decoded_size);
+        return false;
+      }
+    }
+    if (!audio_enabled_.load()) return true;
+    if (offset != out.decoded_size) return false;
+    play_us = static_cast<uint32_t>(esp_timer_get_time() - play_start_us);
   }
 
-  size_t offset = 0;
-  int64_t stall_start = esp_timer_get_time();
-  while (offset < out.decoded_size && enabled_.load() && audio_enabled_.load() && !stop_requested_.load()) {
-    size_t written = speaker_->play(out.buffer + offset, out.decoded_size - offset, pdMS_TO_TICKS(100));
-    if (written > 0) {
-      offset += written;
-      stall_start = esp_timer_get_time();
-      continue;
-    }
-    if ((esp_timer_get_time() - stall_start) / 1000 > AUDIO_WRITE_STALL_MS) {
-      ESP_LOGW(TAG, "Speaker stalled: wrote %u/%u B", (unsigned) offset, (unsigned) out.decoded_size);
-      return false;
-    }
-  }
-  // A MUTE arriving during PCM output is an intentional abort, not an audio drop.
-  if (!audio_enabled_.load()) return true;
-  return offset == out.decoded_size;
+  audio_pipe_play_us_total_.fetch_add(play_us, std::memory_order_relaxed);
+  prev_max = audio_pipe_play_us_max_.load(std::memory_order_relaxed);
+  while (play_us > prev_max && !audio_pipe_play_us_max_.compare_exchange_weak(prev_max, play_us, std::memory_order_relaxed)) {}
+
+  const uint32_t total_us = static_cast<uint32_t>(esp_timer_get_time() - pipe_start_us);
+  audio_pipe_total_us_total_.fetch_add(total_us, std::memory_order_relaxed);
+  audio_pipe_count_.fetch_add(1, std::memory_order_relaxed);
+  prev_max = audio_pipe_total_us_max_.load(std::memory_order_relaxed);
+  while (total_us > prev_max && !audio_pipe_total_us_max_.compare_exchange_weak(prev_max, total_us, std::memory_order_relaxed)) {}
+  return true;
 }
 
 bool BabyMonitor::enqueue_aac_au_(const uint8_t *data, size_t length) {
   if (audio_queue_ == nullptr || length == 0 || length > AudioAu::MAX_BYTES) return false;
   AudioAu item{};
   item.epoch = media_epoch_.load();
+  item.enqueue_us = static_cast<uint32_t>(esp_timer_get_time());
   item.length = static_cast<uint16_t>(length);
   memcpy(item.data.data(), data, length);
-  return xQueueSend(audio_queue_, &item, 0) == pdTRUE;
+
+  // v1.4.2-dev2: characterize producer burstiness. A burst is a run of AUs
+  // whose enqueue-to-enqueue gap is <=10 ms. This is diagnostic only.
+  if (audio_flow_last_enqueue_us_ != 0) {
+    const uint32_t gap_us = item.enqueue_us - audio_flow_last_enqueue_us_;
+    uint32_t prev_min = audio_flow_enq_gap_min_us_.load(std::memory_order_relaxed);
+    while (gap_us < prev_min && !audio_flow_enq_gap_min_us_.compare_exchange_weak(prev_min, gap_us, std::memory_order_relaxed)) {}
+    uint32_t prev_max = audio_flow_enq_gap_max_us_.load(std::memory_order_relaxed);
+    while (gap_us > prev_max && !audio_flow_enq_gap_max_us_.compare_exchange_weak(prev_max, gap_us, std::memory_order_relaxed)) {}
+    audio_flow_current_burst_ = (gap_us <= 10000U) ? (audio_flow_current_burst_ + 1U) : 1U;
+  } else {
+    audio_flow_current_burst_ = 1U;
+  }
+  audio_flow_last_enqueue_us_ = item.enqueue_us;
+  uint32_t burst_prev = audio_flow_burst_max_.load(std::memory_order_relaxed);
+  while (audio_flow_current_burst_ > burst_prev &&
+         !audio_flow_burst_max_.compare_exchange_weak(burst_prev, audio_flow_current_burst_, std::memory_order_relaxed)) {}
+
+  const uint32_t queued_before = static_cast<uint32_t>(uxQueueMessagesWaiting(audio_queue_));
+  uint32_t qprev = audio_pipe_queue_peak_.load(std::memory_order_relaxed);
+  while (queued_before > qprev && !audio_pipe_queue_peak_.compare_exchange_weak(qprev, queued_before, std::memory_order_relaxed)) {}
+  if (xQueueSend(audio_queue_, &item, 0) != pdTRUE) return false;
+  const uint32_t queued_after_send = std::min<uint32_t>(AUDIO_QUEUE_DEPTH, queued_before + 1U);
+  qprev = audio_pipe_queue_peak_.load(std::memory_order_relaxed);
+  while (queued_after_send > qprev && !audio_pipe_queue_peak_.compare_exchange_weak(qprev, queued_after_send, std::memory_order_relaxed)) {}
+  return true;
 }
 
 void BabyMonitor::handle_audio_rtp_(const uint8_t *packet, size_t length) {
@@ -13482,16 +13826,213 @@ int BabyMonitor::draw_jpeg_block_(JPEGDRAW *d) {
   return 1;
 }
 
-bool BabyMonitor::decode_and_display_(const uint8_t *jpeg, size_t jpeg_length) {
-  if (jpeg_decoder_ == nullptr) {
-    ESP_LOGI(TAG, "Allocating JPEGDEC lazily before first decode");
-    jpeg_decoder_ = new (std::nothrow) JPEGDEC();
-    if (jpeg_decoder_ == nullptr) {
-      ESP_LOGE(TAG, "JPEGDEC allocation failed; free_heap=%.1f kB", get_free_heap_kb());
-      return false;
-    }
-    ESP_LOGI(TAG, "JPEGDEC allocated; free_heap=%.1f kB", get_free_heap_kb());
+bool BabyMonitor::ensure_jpeg_decoder_() {
+  if (jpeg_decoder_ != nullptr) return true;
+
+  const size_t bytes = sizeof(JPEGDEC);
+  void *storage = heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const char *region = "internal";
+  if (storage == nullptr) {
+    storage = heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    region = "psram";
   }
+  if (storage == nullptr) {
+    ESP_LOGE(TAG,
+             "dev46 JPEGDEC storage allocation failed: %u B free_internal=%u B free_psram=%u B",
+             (unsigned) bytes,
+             (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned) heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    return false;
+  }
+
+  jpeg_decoder_ = new (storage) JPEGDEC();
+  ESP_LOGI(TAG,
+           "dev46 persistent JPEGDEC ready: %u B region=%s @%p free_internal=%u B free_psram=%u B",
+           (unsigned) bytes, region, jpeg_decoder_,
+           (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+           (unsigned) heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  return true;
+}
+
+void BabyMonitor::dev4_reset_spi_diag_() {
+  dev4_lcd_flushes_.store(0);
+  dev4_lcd_cry_overlap_.store(0);
+  dev4_lcd_slow_flushes_.store(0);
+  dev4_lcd_us_max_.store(0);
+  dev4_int_free_min_.store(UINT32_MAX);
+  dev4_int_largest_min_.store(UINT32_MAX);
+  dev4_dma_free_min_.store(UINT32_MAX);
+  dev4_dma_largest_min_.store(UINT32_MAX);
+  dev4_video_stack_min_.store(UINT32_MAX);
+}
+
+bool BabyMonitor::ensure_lcd_dma_stage_() {
+  if (lcd_dma_stage_ != nullptr) return true;
+
+  lcd_dma_stage_ = static_cast<uint8_t *>(heap_caps_malloc(
+      LCD_DMA_STAGE_BYTES, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  if (lcd_dma_stage_ == nullptr) {
+    ESP_LOGE(TAG,
+             "v1.4.1-dev9 LCD DMA stage allocation failed: %u B int=%uB int_largest=%uB dma=%uB dma_largest=%uB",
+             (unsigned) LCD_DMA_STAGE_BYTES,
+             (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned) heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+             (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+    return false;
+  }
+
+  ESP_LOGI(TAG,
+           "v1.4.1-dev9 LCD DMA stage ready: %u B rows=%u chunks/frame=%u int=%uB int_largest=%uB dma=%uB dma_largest=%uB",
+           (unsigned) LCD_DMA_STAGE_BYTES, (unsigned) LCD_DMA_STAGE_ROWS,
+           (unsigned) ((VIDEO_HEIGHT + LCD_DMA_STAGE_ROWS - 1) / LCD_DMA_STAGE_ROWS),
+           (unsigned) heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+           (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+           (unsigned) heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+           (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+  return true;
+}
+
+void BabyMonitor::dev6_draw_staged_frame_(const char *reason) {
+  if (display_ == nullptr || video_framebuffer_ == nullptr || !ensure_lcd_dma_stage_()) return;
+
+  const bool cry_active = cry_detector_.inference_active();
+  const uint32_t int_free_pre = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const uint32_t int_largest_pre = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const uint32_t dma_free_pre = heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+  const uint32_t dma_largest_pre = heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+  const uint32_t stack_pre = video_task_handle_ ? uxTaskGetStackHighWaterMark(video_task_handle_) : UINT32_MAX;
+
+  const int64_t t0 = esp_timer_get_time();
+  dev5_lcd_flush_start_us_.store(static_cast<uint32_t>(t0), std::memory_order_relaxed);
+  dev5_lcd_flush_active_.store(true, std::memory_order_release);
+
+  // The display component sees only a persistent DMA-capable internal buffer.
+  // No draw_pixels_at() call receives the PSRAM framebuffer directly.
+  for (size_t y = 0; y < VIDEO_HEIGHT; y += LCD_DMA_STAGE_ROWS) {
+    const size_t rows = std::min(LCD_DMA_STAGE_ROWS, VIDEO_HEIGHT - y);
+    const size_t bytes = VIDEO_WIDTH * rows * 2;
+    const uint8_t *src = video_framebuffer_ + y * VIDEO_WIDTH * 2;
+    memcpy(lcd_dma_stage_, src, bytes);
+    display_->draw_pixels_at(0, static_cast<int>(y), VIDEO_WIDTH, rows, lcd_dma_stage_,
+                             display::COLOR_ORDER_RGB, display::COLOR_BITNESS_565,
+                             true, 0, 0, 0);
+  }
+
+  dev5_lcd_flush_active_.store(false, std::memory_order_release);
+  const uint32_t elapsed_us = static_cast<uint32_t>(std::max<int64_t>(0, esp_timer_get_time() - t0));
+
+  const uint32_t int_free_post = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const uint32_t int_largest_post = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  const uint32_t dma_free_post = heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+  const uint32_t dma_largest_post = heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+  const uint32_t stack_post = video_task_handle_ ? uxTaskGetStackHighWaterMark(video_task_handle_) : UINT32_MAX;
+
+  auto atomic_min = [](std::atomic<uint32_t> &dst, uint32_t value) {
+    uint32_t cur = dst.load(std::memory_order_relaxed);
+    while (value < cur && !dst.compare_exchange_weak(cur, value, std::memory_order_relaxed)) {}
+  };
+  auto atomic_max = [](std::atomic<uint32_t> &dst, uint32_t value) {
+    uint32_t cur = dst.load(std::memory_order_relaxed);
+    while (value > cur && !dst.compare_exchange_weak(cur, value, std::memory_order_relaxed)) {}
+  };
+
+  dev4_lcd_flushes_.fetch_add(1, std::memory_order_relaxed);
+  if (cry_active) dev4_lcd_cry_overlap_.fetch_add(1, std::memory_order_relaxed);
+  if (elapsed_us >= 80000U) dev4_lcd_slow_flushes_.fetch_add(1, std::memory_order_relaxed);
+  atomic_max(dev4_lcd_us_max_, elapsed_us);
+  atomic_min(dev4_int_free_min_, std::min(int_free_pre, int_free_post));
+  atomic_min(dev4_int_largest_min_, std::min(int_largest_pre, int_largest_post));
+  atomic_min(dev4_dma_free_min_, std::min(dma_free_pre, dma_free_post));
+  atomic_min(dev4_dma_largest_min_, std::min(dma_largest_pre, dma_largest_post));
+  atomic_min(dev4_video_stack_min_, std::min(stack_pre, stack_post));
+
+  (void) reason;
+}
+
+void BabyMonitor::record_spi_err101() {
+  // Called from logger.on_message while the original spi-esp-idf error is being
+  // emitted. Do not allocate, do not log and do not touch queues from here.
+  const uint32_t now_us = static_cast<uint32_t>(esp_timer_get_time());
+  const bool in_flush = dev5_lcd_flush_active_.load(std::memory_order_acquire);
+  const uint32_t flush_start = dev5_lcd_flush_start_us_.load(std::memory_order_relaxed);
+
+  dev5_spi_err101_total_.fetch_add(1, std::memory_order_relaxed);
+  dev5_spi_err101_window_.fetch_add(1, std::memory_order_relaxed);
+  dev5_spi_err101_last_us_.store(now_us, std::memory_order_relaxed);
+  dev5_spi_err101_int_free_.store(
+      heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT), std::memory_order_relaxed);
+  dev5_spi_err101_int_largest_.store(
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT), std::memory_order_relaxed);
+  dev5_spi_err101_dma_free_.store(
+      heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL), std::memory_order_relaxed);
+  dev5_spi_err101_dma_largest_.store(
+      heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL), std::memory_order_relaxed);
+  dev5_spi_err101_stack_.store(uxTaskGetStackHighWaterMark(nullptr), std::memory_order_relaxed);
+  dev5_spi_err101_core_.store(static_cast<uint8_t>(xPortGetCoreID()), std::memory_order_relaxed);
+  dev5_spi_err101_in_flush_.store(in_flush, std::memory_order_relaxed);
+  dev5_spi_err101_cry_active_.store(cry_detector_.inference_active(), std::memory_order_relaxed);
+  dev5_spi_err101_video_task_.store(
+      video_task_handle_ != nullptr && xTaskGetCurrentTaskHandle() == video_task_handle_,
+      std::memory_order_relaxed);
+  dev5_spi_err101_flush_offset_us_.store(in_flush ? (now_us - flush_start) : 0U,
+                                         std::memory_order_relaxed);
+}
+
+void BabyMonitor::dev4_log_spi_diag_() {
+  const uint32_t flushes = dev4_lcd_flushes_.exchange(0);
+  const uint32_t cry_overlap = dev4_lcd_cry_overlap_.exchange(0);
+  const uint32_t slow80 = dev4_lcd_slow_flushes_.exchange(0);
+  const uint32_t lcd_max = dev4_lcd_us_max_.exchange(0);
+  const uint32_t int_min = dev4_int_free_min_.exchange(UINT32_MAX);
+  const uint32_t int_largest = dev4_int_largest_min_.exchange(UINT32_MAX);
+  const uint32_t dma_min = dev4_dma_free_min_.exchange(UINT32_MAX);
+  const uint32_t dma_largest = dev4_dma_largest_min_.exchange(UINT32_MAX);
+  const uint32_t stack_min = dev4_video_stack_min_.exchange(UINT32_MAX);
+
+  if (flushes == 0) {
+    ESP_LOGI(TAG, "v1.4.1-dev9 SPI_DIAG: flush=0 (no LCD transfer in window)");
+  } else {
+    ESP_LOGI(TAG,
+             "v1.4.1-dev9 SPI_DIAG: flush=%u cry_overlap=%u slow80=%u lcd_max=%uus "
+             "int_min=%uB int_largest_min=%uB dma_min=%uB dma_largest_min=%uB "
+             "video_stack_min=%uB src=DMA-stage/16rows",
+             (unsigned) flushes, (unsigned) cry_overlap, (unsigned) slow80, (unsigned) lcd_max,
+             (unsigned) (int_min == UINT32_MAX ? 0U : int_min),
+             (unsigned) (int_largest == UINT32_MAX ? 0U : int_largest),
+             (unsigned) (dma_min == UINT32_MAX ? 0U : dma_min),
+             (unsigned) (dma_largest == UINT32_MAX ? 0U : dma_largest),
+             (unsigned) (stack_min == UINT32_MAX ? 0U : stack_min));
+  }
+
+  const uint32_t err_win = dev5_spi_err101_window_.exchange(0, std::memory_order_relaxed);
+  if (err_win != 0) {
+    const uint32_t now_us = static_cast<uint32_t>(esp_timer_get_time());
+    const uint32_t last_us = dev5_spi_err101_last_us_.load(std::memory_order_relaxed);
+    ESP_LOGI(TAG,
+             "v1.4.1-dev9 SPI_ERR101: win=%u total=%u age=%uus in_flush=%s at=%uus "
+             "cry=%s core=%u task=%s int=%uB int_largest=%uB dma=%uB dma_largest=%uB stack=%uB",
+             (unsigned) err_win,
+             (unsigned) dev5_spi_err101_total_.load(std::memory_order_relaxed),
+             (unsigned) (now_us - last_us),
+             dev5_spi_err101_in_flush_.load(std::memory_order_relaxed) ? "YES" : "NO",
+             (unsigned) dev5_spi_err101_flush_offset_us_.load(std::memory_order_relaxed),
+             dev5_spi_err101_cry_active_.load(std::memory_order_relaxed) ? "YES" : "NO",
+             (unsigned) dev5_spi_err101_core_.load(std::memory_order_relaxed),
+             dev5_spi_err101_video_task_.load(std::memory_order_relaxed) ? "baby_video" : "other",
+             (unsigned) dev5_spi_err101_int_free_.load(std::memory_order_relaxed),
+             (unsigned) dev5_spi_err101_int_largest_.load(std::memory_order_relaxed),
+             (unsigned) dev5_spi_err101_dma_free_.load(std::memory_order_relaxed),
+             (unsigned) dev5_spi_err101_dma_largest_.load(std::memory_order_relaxed),
+             (unsigned) dev5_spi_err101_stack_.load(std::memory_order_relaxed));
+  }
+}
+
+bool BabyMonitor::decode_and_display_(const uint8_t *jpeg, size_t jpeg_length) {
+  // Normally guaranteed by start_session_(). Keep a defensive check so future
+  // call paths cannot dereference a missing decoder. This path still avoids
+  // global operator new.
+  if (!ensure_jpeg_decoder_()) return false;
 
   if (video_framebuffer_ == nullptr) {
     video_framebuffer_ = static_cast<uint8_t *>(
@@ -13536,15 +14077,18 @@ bool BabyMonitor::decode_and_display_(const uint8_t *jpeg, size_t jpeg_length) {
 
   if (!display_ || !enabled_.load() || stop_requested_.load() || video_reset_requested_.load()) return false;
 
+  // v1.1.0 zero-copy video handoff. The detector sees the decoded camera
+  // frame before local UI overlays are drawn. It receives the existing PSRAM
+  // framebuffer directly; no second QVGA framebuffer is allocated.
+  motion_detector_.process_rgb565_be(video_framebuffer_, static_cast<uint16_t>(VIDEO_WIDTH),
+                                     static_cast<uint16_t>(VIDEO_HEIGHT), VIDEO_WIDTH * 2);
+
   // Draw the lightweight UI directly into the completed RGB565 framebuffer.
   // No LVGL, no widget tree and no extra display refresh.
   render_ui_overlay_();
 
   const int64_t lcd_start_us = esp_timer_get_time();
-  display_->draw_pixels_at(0, 0, VIDEO_WIDTH, VIDEO_HEIGHT,
-                           video_framebuffer_,
-                           display::COLOR_ORDER_RGB, display::COLOR_BITNESS_565,
-                           true, 0, 0, 0);
+  dev6_draw_staged_frame_("video");
   const uint32_t lcd_us = static_cast<uint32_t>(esp_timer_get_time() - lcd_start_us);
   const uint32_t total_us = static_cast<uint32_t>(esp_timer_get_time() - total_start_us);
 
@@ -13723,7 +14267,7 @@ void BabyMonitor::update_ui_wifi_() {
 
 void BabyMonitor::ui_draw_wifi_() {
   update_ui_wifi_();
-  constexpr int x = 268, y = 4;
+  constexpr int x = 74, y = 4;
   ui_blend_round_rect_(x - 5, y - 3, 26, 16, 4, 0x0000, 118);
   int bars = 0;
   if (ui_wifi_rssi_ > -90) bars = 1;
@@ -13738,7 +14282,7 @@ void BabyMonitor::ui_draw_wifi_() {
 }
 
 void BabyMonitor::ui_draw_battery_placeholder_() {
-  constexpr int x = 296, y = 4;
+  constexpr int x = 47, y = 4;
   ui_blend_round_rect_(x - 5, y - 3, 27, 16, 4, 0x0000, 118);
   ui_draw_rect_(x, y, 17, 9, 0xffff);
   ui_fill_rect_(x + 17, y + 3, 2, 3, 0xffff);
@@ -13778,16 +14322,16 @@ void BabyMonitor::ui_draw_alarm_border_(uint8_t level) {
   if (level == 0) return;
 
   // Lekka animacja bez osobnego tasku/UI refresh. Faza jest liczona
-  // only while rendering the next camera frame.
+  // tylko podczas renderowania kolejnej klatki kamery.
   const uint32_t now = millis();
   uint16_t color;
   int thickness;
   if (level >= 2) {
-    // Level 2: fast 4 Hz red pulse with a thicker border.
+    // Level 2: szybkie czerwone pulsowanie 4 Hz, grubsza ramka.
     color = ((now / 250U) & 1U) ? 0xf800 : 0x7800;
     thickness = 5;
   } else {
-    // Level 1: calmer 2 Hz orange pulse.
+    // Level 1: calmer orange pulsing at 2 Hz.
     color = ((now / 500U) & 1U) ? 0xfd20 : 0x8200;
     thickness = 3;
   }
@@ -13805,9 +14349,72 @@ void BabyMonitor::ui_draw_alarm_border_(uint8_t level) {
   }
 }
 
+void BabyMonitor::ui_draw_alarm_causes_(uint8_t mask) {
+  if (mask == 0) return;
+
+  // v1.5.0: alarm causes extend the left status bar to the right.
+  // Sound T2 supersedes T1 in the UI; motion and Cry may be shown together.
+  // When audio is ON the mute icon disappears and the alarm group closes the gap.
+  int x = audio_enabled_.load() ? 103 : 129;
+  constexpr int y = 2;
+  constexpr int box_w = 22;
+  constexpr int box_h = 16;
+  constexpr int gap = 3;
+  const uint16_t white = 0xffff;
+  const uint16_t amber = 0xfd20;
+  const uint16_t red = 0xf800;
+
+  auto box = [&](uint16_t accent) {
+    ui_blend_round_rect_(x, y, box_w, box_h, 4, 0x0000, 138);
+    ui_fill_rect_(x + 2, y + box_h - 2, box_w - 4, 1, accent);
+  };
+  auto advance = [&]() { x += box_w + gap; };
+
+  if (mask & 0x01U) {  // local motion
+    box(amber);
+    // Small moving-person pictogram.
+    ui_fill_rect_(x + 10, y + 3, 3, 3, white);          // head
+    ui_fill_rect_(x + 9, y + 6, 3, 5, white);           // torso
+    ui_fill_rect_(x + 6, y + 7, 4, 2, white);           // rear arm
+    ui_fill_rect_(x + 12, y + 7, 4, 2, white);          // front arm
+    ui_fill_rect_(x + 7, y + 11, 4, 2, white);          // rear leg
+    ui_fill_rect_(x + 11, y + 10, 2, 4, white);         // front leg
+    advance();
+  }
+
+  if (mask & 0x04U) {  // sound T2
+    box(red);
+    ui_fill_rect_(x + 5, y + 7, 4, 5, white);
+    ui_fill_rect_(x + 9, y + 6, 2, 7, white);
+    ui_fill_rect_(x + 11, y + 5, 2, 9, white);
+    ui_fill_rect_(x + 15, y + 6, 1, 7, red);
+    ui_fill_rect_(x + 18, y + 4, 1, 11, red);
+    advance();
+  } else if (mask & 0x02U) {  // sound T1
+    box(amber);
+    ui_fill_rect_(x + 5, y + 7, 4, 5, white);
+    ui_fill_rect_(x + 9, y + 6, 2, 7, white);
+    ui_fill_rect_(x + 11, y + 5, 2, 9, white);
+    ui_fill_rect_(x + 16, y + 6, 1, 7, amber);
+    advance();
+  }
+
+  if (mask & 0x08U) {  // local Cry ML
+    box(red);
+    // Baby-face / tear pictogram kept intentionally geometric for 320x240 UI.
+    ui_draw_rect_(x + 6, y + 4, 10, 9, white);
+    ui_fill_rect_(x + 8, y + 6, 2, 2, white);
+    ui_fill_rect_(x + 13, y + 6, 2, 2, white);
+    ui_fill_rect_(x + 9, y + 10, 5, 1, white);
+    ui_fill_rect_(x + 17, y + 9, 2, 3, red);
+    ui_set_pixel_(x + 18, y + 12, red);
+    advance();
+  }
+}
+
 void BabyMonitor::ui_draw_mute_icon_() {
   if (audio_enabled_.load()) return;
-  constexpr int x = 238, y = 3;
+  constexpr int x = 103, y = 3;
   ui_blend_round_rect_(x - 3, y - 2, 26, 16, 4, 0x0000, 128);
   const uint16_t white = 0xffff;
   const uint16_t red = 0xf800;
@@ -13831,12 +14438,11 @@ void BabyMonitor::render_no_stream_placeholder_() {
     }
   }
 
-  // Restore the prepared 320x240 artwork directly into the existing big-endian
-  // RGB565 framebuffer. The image is RLE-compressed in flash, so the placeholder
-  // requires no additional persistent PSRAM allocation.
+  // Private v1.0.0 visual variant: restore the prepared 320x240 artwork
+  // directly into the existing big-endian RGB565 framebuffer. The artwork is
+  // stored RLE-compressed in flash, so it consumes no additional persistent PSRAM.
   size_t px = 0;
-  for (size_t i = 0; i + 1 < NO_STREAM_PLACEHOLDER_RLE_WORDS &&
-                     px < VIDEO_WIDTH * VIDEO_HEIGHT; i += 2) {
+  for (size_t i = 0; i + 1 < NO_STREAM_PLACEHOLDER_RLE_WORDS && px < VIDEO_WIDTH * VIDEO_HEIGHT; i += 2) {
     const uint16_t count = NO_STREAM_PLACEHOLDER_RLE[i];
     const uint16_t color = NO_STREAM_PLACEHOLDER_RLE[i + 1];
     for (uint16_t n = 0; n < count && px < VIDEO_WIDTH * VIDEO_HEIGHT; ++n, ++px) {
@@ -13845,30 +14451,31 @@ void BabyMonitor::render_no_stream_placeholder_() {
       video_framebuffer_[off + 1] = static_cast<uint8_t>(color & 0xff);
     }
   }
-
   if (px != VIDEO_WIDTH * VIDEO_HEIGHT) {
-    ESP_LOGE(TAG, "Placeholder RLE decode incomplete: %u/%u pixels",
-             (unsigned) px, (unsigned) (VIDEO_WIDTH * VIDEO_HEIGHT));
+    ESP_LOGE(TAG, "Placeholder RLE decode incomplete: %u/%u pixels", (unsigned) px,
+             (unsigned) (VIDEO_WIDTH * VIDEO_HEIGHT));
     return;
   }
 
-  // Preserve normal-frame overlay semantics over the placeholder.
+  // Preserve the production overlay semantics: RTSP/Wi-Fi/battery/mute,
+  // selected camera name and alarm border remain identical to a normal frame.
   render_ui_overlay_();
-  display_->draw_pixels_at(0, 0, VIDEO_WIDTH, VIDEO_HEIGHT, video_framebuffer_,
-                           display::COLOR_ORDER_RGB, display::COLOR_BITNESS_565,
-                           true, 0, 0, 0);
-  ESP_LOGI(TAG, "No-stream image placeholder: %s",
-           cameras_[active_camera_].name.c_str());
+  dev6_draw_staged_frame_("placeholder");
+  ESP_LOGI(TAG, "No-stream image placeholder: %s", cameras_[active_camera_].name.c_str());
 }
 
 void BabyMonitor::render_ui_overlay_() {
   if (video_framebuffer_ == nullptr) return;
-  ui_draw_media_status_();
-  ui_draw_wifi_();
-  ui_draw_battery_placeholder_();
-  ui_draw_mute_icon_();
-  ui_draw_camera_name_();
+
+  // v1.5.0: alarm border is the bottom overlay layer. Status/name UI is
+  // drawn afterwards, so the frame never paints over interface elements.
   ui_draw_alarm_border_(ui_alarm_level_.load());
+  ui_draw_media_status_();
+  ui_draw_battery_placeholder_();
+  ui_draw_wifi_();
+  ui_draw_mute_icon_();
+  ui_draw_alarm_causes_(ui_alarm_cause_mask_.load());
+  ui_draw_camera_name_();
 }
 
 bool BabyMonitor::parse_auth_challenge_(const std::string &h){std::string l=lowercase_(h);if(l.rfind("digest",0)==0){auth_.type=RtspAuth::Type::DIGEST;auth_.realm=find_param_(h,"realm");auth_.nonce=find_param_(h,"nonce");auth_.opaque=find_param_(h,"opaque");auth_.qop=find_param_(h,"qop");auth_.algorithm=find_param_(h,"algorithm");auth_.nonce_count=0;return !auth_.realm.empty()&&!auth_.nonce.empty()&&(auth_.algorithm.empty()||lowercase_(auth_.algorithm)=="md5");}if(l.rfind("basic",0)==0){auth_.type=RtspAuth::Type::BASIC;return true;}return false;}
