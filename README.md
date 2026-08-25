@@ -2,41 +2,60 @@
 
 A local-first dual-camera baby monitor for the Espressif ESP32-S3-BOX-3, built with ESPHome and a custom RTSP/RTP media component.
 
-The monitor receives media directly from IP cameras: RTP/JPEG video is reconstructed and decoded to a 320×240 RGB565 framebuffer, while RTP/AAC audio is decoded and played through the ESP32-S3-BOX-3 audio path. Media work is separated from the ESPHome main loop to reduce blocking and improve responsiveness.
+Version **1.5.0** adds a mature local analysis pipeline on top of the stable media engine:
 
-## Highlights
+- direct RTP/JPEG video and AAC audio;
+- local PCM sound analysis with adaptive T1/T2 alarms;
+- local frame-based motion detection;
+- local on-device Cry ML using TensorFlow Lite Micro;
+- a left-side status strip showing RTSP, battery, Wi-Fi, MUTE and active alarm causes;
+- explicit task and memory placement designed for ESP32-S3 internal RAM, DMA memory and PSRAM constraints.
 
-- Two RTSP cameras with fast switching.
-- Direct MJPEG/RTP video rendering on the 320×240 LCD.
-- AAC 16 kHz mono audio playback through ES8311/I2S.
-- Separate RTSP, audio, video and control tasks.
-- Monitor ON/OFF, software volume, hardware mute and Night Mode.
-- Last-frame retention during short stream interruptions.
-- Lightweight on-screen status and alarm overlays.
-- Adaptive per-camera sound alarms using Home Assistant sound-level sensors.
-- Optional motion correlation for stronger alarm classification.
-- Optional external crying detection, disabled by default.
-- Diagnostics for RTSP state, FPS, bitrate, dropped/replaced frames, memory, Wi-Fi, battery and alarm thresholds.
+## Key features
 
-## Tested baseline
+- Two RTSP cameras with user-defined display names.
+- Camera names configured once in `substitutions` and reused on the LCD and in the Home Assistant `Camera` select entity.
+- Low-latency MJPEG/RTP video to the 320×240 LCD.
+- AAC 16 kHz mono audio through ES8311/I2S.
+- Software volume and physical hardware MUTE.
+- Night Mode with alarm-driven screen wake.
+- Adaptive sound baseline per camera.
+- Local motion detection from decoded RGB565 video.
+- Local Cry ML from decoded source PCM.
+- Alarm Levels 0/1/2 with independent cause icons.
+- Dedicated 320×240 no-stream image placeholder.
+- Extensive Home Assistant diagnostics and tuning controls.
 
-- ESPHome 2026.7.4
-- ESP-IDF 5.5.5
-- ESP32-S3 at 240 MHz
-- Octal PSRAM at 80 MHz
-- ESP32-S3-BOX-3 LCD: 320×240 RGB565
-- MJPEG over RTSP/RTP
-- AAC 16 kHz mono audio
+## Camera names
 
-## Camera stream recommendation
+Edit only these substitutions:
 
-Use a **low-resolution camera substream**, not the high-resolution primary stream.
+```yaml
+substitutions:
+  camera_1_name: "Nursery"
+  camera_2_name: "Bedroom"
+```
 
-A typical deployment is:
+The values are used by:
+
+1. the camera label rendered on the monitor;
+2. the options exposed by the Home Assistant `Camera` select entity;
+3. camera-specific alarm tuning entity names;
+4. alarm-reason text and logs.
+
+Use short names without embedded double quotes.
+
+## Camera stream requirements
+
+Use a **low-resolution MJPEG substream**.
+
+The monitor display is 320×240 and the firmware is tuned for lightweight monitoring streams. A 1080p, 4 MP or 8 MP primary stream adds network, JPEG decode and memory pressure without improving the LCD output.
+
+Recommended topology:
 
 ```text
 Camera
- ├─ Main stream  -> NVR / Frigate / recorder
+ ├─ Main stream  -> NVR / recorder
  └─ Substream    -> ESP32-S3-BOX-3
                     MJPEG
                     modest frame rate
@@ -44,75 +63,89 @@ Camera
                     AAC 16 kHz mono
 ```
 
-The display is only 320×240 and the component is designed for lightweight monitoring streams. It is not intended to decode high-resolution primary camera streams. Exact RTSP URLs and substream selectors are camera-vendor specific; consult your camera documentation.
+RTSP paths are vendor-specific. Configure `camera_1_rtsp_path` and `camera_2_rtsp_path` for your camera models.
 
-## Requirements
+## Cry ML model setup
 
-### Required for video/audio monitoring
+The public repository does **not** bundle the model binary.
 
-- ESP32-S3-BOX-3
-- ESPHome
-- One or two compatible RTSP cameras
-- MJPEG video stream
-- AAC audio compatible with the tested 16 kHz mono path
+Run:
 
-### Required for adaptive sound alarms
-
-- Home Assistant connected through the ESPHome API
-- A sound-level sensor for each camera
-- Optional motion binary sensors for motion/sound correlation
-
-### Optional
-
-- A Home Assistant binary sensor that reports crying events
-- Frigate audio classification can provide such a sensor, but Frigate is not required
-
-Cry detection is disabled by default. See [Optional cry detection](docs/configuration.md#optional-cry-detection).
-
-## Repository layout
-
-```text
-.
-├── baby_monitor.yaml
-├── secrets.example.yaml
-├── components/baby_monitor/
-├── docs/
-└── examples/
+```bash
+python3 tools/fetch_cry_model.py
 ```
+
+The script downloads the upstream `chayuto/yamnet-cry-distill-int8` model, verifies its pinned revision, expected 112,848-byte size and SHA-256, then generates the untracked `components/baby_monitor/cry_model_blob.inc` file.
+
+Without this step, the firmware still builds and the media, sound and motion paths remain available, but Cry ML reports that no model is embedded.
+
+See [ML Cry](docs/ml-cry.md) and [Third-party model](THIRD_PARTY_MODEL.md).
 
 ## Installation
 
-1. Clone or copy this repository into your ESPHome configuration directory.
-2. Copy `secrets.example.yaml` to `secrets.yaml` and enter your Wi-Fi, camera and network values.
-3. Set the camera RTSP path in `baby_monitor.yaml` for your camera model.
-4. Configure the four Home Assistant entity substitutions for motion and sound level.
-5. Prefer a low-resolution MJPEG substream.
-6. Validate and compile the configuration with ESPHome.
-7. Flash the ESP32-S3-BOX-3.
-8. Verify Monitor ON/OFF, audio, camera switching, Night Mode and stream recovery.
+1. Copy or clone the repository into your ESPHome configuration directory.
+2. Copy `secrets.example.yaml` to `secrets.yaml`.
+3. Enter Wi-Fi, camera and optional static-network values.
+4. Set `camera_1_name` and `camera_2_name`.
+5. Configure each camera's RTSP substream path.
+6. Run `python3 tools/fetch_cry_model.py` if you want local Cry ML.
+7. Validate and compile `baby_monitor.yaml`.
+8. Flash the ESP32-S3-BOX-3.
+9. Verify both cameras, audio, physical MUTE, Night Mode, motion, sound alarms and Cry ML diagnostics.
 
-See [Configuration](docs/configuration.md) for details.
+## Documentation
 
-## Alarm behavior
+- [Architecture](docs/architecture.md)
+- [Detailed dataflow](docs/dataflow.md)
+- [Development history](docs/development-history.md)
+- [Alarm engine and tuning](docs/alarm-engine.md)
+- [Cry ML](docs/ml-cry.md)
+- [Configuration](docs/configuration.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Licensing and third-party software](docs/licensing.md)
 
-The alarm engine maintains an independent adaptive background baseline for each camera. T1 and T2 are calculated from that baseline plus configurable offsets and safety floors. Quiet samples slowly update the baseline; a separate stable-background path can follow a persistent change in ambient noise without learning alarm-like levels.
+## Tested baseline
 
-See [Alarm engine](docs/alarm-engine.md) for the complete algorithm, timing, re-arming rules and tuning examples.
+The v1.5.0 release has been developed and tested on:
 
-## Privacy and network configuration
+- **Hardware:** Espressif ESP32-S3-BOX-3.
+- **ESPHome:** 2026.7.x, using the ESP-IDF framework.
+- **Display:** the integrated 320×240 LCD of the ESP32-S3-BOX-3.
+- **Audio output:** the integrated ES8311/I2S audio path.
+- **Camera topology:** two IP cameras selected one at a time through a low-resolution RTSP substream.
+- **Video:** RTP/JPEG (MJPEG), decoded locally to a 320×240 RGB565 framebuffer.
+- **Audio:** RTP/AAC, 16 kHz mono in the tested configuration.
+- **Local analysis:** NoiseAnalyzer, MotionDetector and optional CryDetector/TensorFlow Lite Micro.
+- **Home Assistant integration:** native ESPHome API entities for control, diagnostics and alarm tuning.
 
-Store credentials and installation-specific addresses in `secrets.yaml`. The provided `.gitignore` excludes that file.
+The stable media baseline uses an AAC queue depth of 8, persistent JPEG decode resources, a 16-row LCD DMA staging buffer and PSRAM-backed media-task stacks.
 
-Do not expose camera RTSP services or the ESPHome API directly to the public Internet.
+Hardware compatibility beyond the **ESP32-S3-BOX-3 has not been tested**. In particular, the configuration assumes the BOX-3 display, touch/button inputs, ES8311 audio path, PSRAM layout and board-specific pin assignments.
+
+## Requirements
+
+Before using this project, you need:
+
+- an **Espressif ESP32-S3-BOX-3**;
+- a current ESPHome installation compatible with the configuration's declared minimum version;
+- Home Assistant with the ESPHome integration if you want the exposed controls, diagnostics and tuning entities;
+- one or two IP cameras providing an RTSP **MJPEG/RTP substream**;
+- camera credentials and the correct vendor-specific RTSP paths;
+- an AAC audio track compatible with the tested 16 kHz mono audio path if camera audio is required;
+- a Wi-Fi network reachable by both the monitor and cameras;
+- Python 3 with network access during setup if local Cry ML is enabled, so `tools/fetch_cry_model.py` can obtain and verify the optional upstream model.
+
+A dedicated low-resolution camera substream is strongly recommended. The firmware is designed around the 320×240 display and is **not intended for high-resolution primary camera streams**.
+
 
 ## License
 
-Original project source code and documentation in this repository are licensed under the Apache License 2.0.
+Original project source code and documentation in this repository are released under the Apache License 2.0.
 
-Build-time dependencies retain their own licenses. In particular, `espressif/esp_audio_codec` uses the **Espressif Modified MIT License** and is restricted to use with Espressif Systems products. This project targets the ESP32-S3-BOX-3, an Espressif product.
+Third-party dependencies and the optional downloaded Cry ML model retain their own licenses. In particular, `esp_audio_codec` uses the Espressif Modified MIT License and is restricted to use with Espressif products.
 
-See [Third-party notices](THIRD_PARTY_NOTICES.md) and [Licensing](docs/licensing.md).
+See `THIRD_PARTY_NOTICES.md`, `THIRD_PARTY_MODEL.md` and `docs/licensing.md`.
 
 ## Trademarks
 
-ESPHome, Home Assistant, Espressif, ESP32, ESP32-S3-BOX-3, Frigate and other product names or trademarks are the property of their respective owners. This independent project is not affiliated with or endorsed by those organizations.
+Third-party names are used only to identify compatibility, dependencies or upstream artifacts. All trademarks remain the property of their respective owners. No affiliation or endorsement is implied.

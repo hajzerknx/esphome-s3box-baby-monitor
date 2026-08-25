@@ -1,18 +1,36 @@
 # Changelog
 
-## 1.0.0
+## 1.5.0
 
-Initial public release.
+Initial public release of the current stable v1.5 firmware line.
 
-### Features
+### Media and system
 
-- Dual-camera RTSP monitoring on ESP32-S3-BOX-3.
-- Direct RTP/JPEG reconstruction and display.
-- AAC audio decode and ES8311/I2S playback.
-- Independent RTSP, audio, video and control tasks.
-- Camera switching, Monitor ON/OFF, mute, volume and Night Mode.
-- Adaptive per-camera sound alarm baseline with T1/T2 thresholds.
-- Motion/sound correlation.
-- Optional external crying detection package, disabled by default.
-- Home Assistant diagnostics and tuning controls.
-- Stream-recovery behavior with last-frame retention and a dedicated 320×240 no-stream image placeholder.
+- Dual-camera direct RTSP/RTP monitoring.
+- RTP/JPEG reconstruction and JPEGDEC rendering.
+- AAC audio decode with queue depth 8.
+- 320×240 RGB565 framebuffer in PSRAM.
+- 16-row internal/DMA staging buffer for LCD transfers.
+- Media task stacks explicitly placed in PSRAM where supported.
+- Dedicated no-stream image placeholder.
+
+### Local analysis
+
+- NoiseAnalyzer on decoded source PCM.
+- Adaptive per-camera T1/T2 sound alarms.
+- Local MotionDetector on decoded RGB565 frames.
+- Local TensorFlow Lite Micro Cry ML on decoded PCM.
+- Cry ML promoted to a production Level-2 alarm source.
+
+### UI
+
+- Left-side status strip: RTSP, battery, Wi-Fi, optional MUTE, alarm causes.
+- Alarm cause bits for motion, T1, T2 and Cry ML.
+- T2 visually supersedes T1 while independent causes remain visible.
+- Alarm border rendered below UI elements.
+- Camera names configurable through substitutions and shared by LCD and Home Assistant Camera select.
+
+### Audio behavior
+
+- Software audio intent defaults to ON after reboot.
+- Physical hardware MUTE always overrides software SOUND ON.

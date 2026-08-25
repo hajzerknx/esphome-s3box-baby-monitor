@@ -1,29 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# ESP32-S3-BOX-3 Baby Monitor — v1.0.0
+# ESP32-S3-BOX-3 Baby Monitor — public v1.5.0
 #
-# Copy secrets.example.yaml to secrets.yaml and configure your own values.
-# Cry detection is disabled by default. To enable an external crying classifier,
-# uncomment the package block below and configure the optional package.
+# Set camera_1_name and camera_2_name below. The same names are shown both on
+# the monitor LCD and in the Home Assistant Camera select entity.
 #
-# packages:
-#   cry_detection: !include examples/cry-detection-home-assistant.yaml
+# Before compiling with Cry ML, run:
+#   python3 tools/fetch_cry_model.py
+#
+# Use a low-resolution MJPEG substream. High-resolution primary streams are not
+# an intended workload for this 320x240 ESP32-S3 display.
 
 substitutions:
   name: baby-monitor-box3
   friendly_name: Baby Monitor BOX-3
 
-  camera_1_motion_entity: binary_sensor.camera_1_motion
-  camera_1_sound_entity: sensor.camera_1_sound_level
-  camera_2_motion_entity: binary_sensor.camera_2_motion
-  camera_2_sound_entity: sensor.camera_2_sound_level
+  # These names are shown on the monitor and in the Home Assistant Camera select entity.
+  camera_1_name: "Camera 1"
+  camera_2_name: "Camera 2"
 
-  camera_user: !secret baby_monitor_box3__camera_user
-  camera_password: !secret baby_monitor_box3__camera_password
+  camera_1_user: !secret baby_monitor_camera_1_user
+  camera_2_user: !secret baby_monitor_camera_2_user
+  camera_1_password: !secret baby_monitor_camera_1_password
+  camera_2_password: !secret baby_monitor_camera_2_password
 
   camera_1_host: !secret baby_monitor_camera_1_host
   camera_2_host: !secret baby_monitor_camera_2_host
-  camera_rtsp_path: "/cam/realmonitor?channel=1&subtype=1"
+  camera_1_rtsp_path: "/cam/realmonitor?channel=1&subtype=1"
+  camera_2_rtsp_path: "/cam/realmonitor?channel=1&subtype=1"
 
   battery_voltage_factor: "4.01"
 
@@ -37,12 +41,12 @@ esphome:
       - delay: 250ms
       - lambda: |-
           id(hardware_mute_active) = id(hardware_mute_status).state;
-          const bool effective = id(audio_ha_requested) && !id(hardware_mute_active);
+          const bool effective = id(audio_ha_requested_v113) && !id(hardware_mute_active);
           id(camera_audio_enabled).publish_state(effective);
           id(baby_monitor_media).set_audio_enabled(effective);
           id(speaker_amp_enable).turn_off();
           ESP_LOGI("baby_mute", "Boot sync: requested=%s hardware=%s effective=%s",
-                   id(audio_ha_requested) ? "ON" : "OFF",
+                   id(audio_ha_requested_v113) ? "ON" : "OFF",
                    id(hardware_mute_active) ? "MUTED" : "UNMUTED",
                    effective ? "ON" : "OFF");
 
@@ -56,6 +60,8 @@ esp32:
       CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
       CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
       CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM: "y"
+
 
 psram:
   mode: octal
@@ -65,6 +71,15 @@ psram:
 logger:
   level: INFO
   hardware_uart: USB_SERIAL_JTAG
+  on_message:
+    level: ERROR
+    then:
+      - lambda: |-
+          if (tag != nullptr && message != nullptr &&
+              strcmp(tag, "spi-esp-idf") == 0 &&
+              strstr(message, "Transmit failed - err 101") != nullptr) {
+            id(baby_monitor_media).record_spi_err101();
+          }
 
 api:
 
@@ -188,20 +203,20 @@ baby_monitor:
   audio_volume: 5%
 
   camera_1:
-    name: "Camera 1"
+    name: "${camera_1_name}"
     host: ${camera_1_host}
     port: 554
-    username: ${camera_user}
-    password: ${camera_password}
-    path: "${camera_rtsp_path}"
+    username: ${camera_1_user}
+    password: ${camera_1_password}
+    path: "${camera_1_rtsp_path}"
 
   camera_2:
-    name: "Camera 2"
+    name: "${camera_2_name}"
     host: ${camera_2_host}
     port: 554
-    username: ${camera_user}
-    password: ${camera_password}
-    path: "${camera_rtsp_path}"
+    username: ${camera_2_user}
+    password: ${camera_2_password}
+    path: "${camera_2_rtsp_path}"
 
 globals:
   - id: active_camera_index
@@ -239,6 +254,11 @@ globals:
     restore_value: no
     initial_value: "0"
 
+  - id: camera_1_baseline_resume_after_ms_v120d4
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
   - id: camera_2_ambient_candidate
     type: float
     restore_value: no
@@ -260,21 +280,26 @@ globals:
     restore_value: no
     initial_value: "0"
 
-  - id: camera_audio_volume_pct
+  - id: camera_2_baseline_resume_after_ms_v120d4
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+  - id: camera_audio_volume_pct_v122
     type: float
     restore_value: yes
     initial_value: "25.0"
 
-  - id: audio_ha_requested
+  - id: audio_ha_requested_v113
     type: bool
-    restore_value: yes
+    restore_value: no
     initial_value: "true"
   - id: hardware_mute_active
     type: bool
     restore_value: no
     initial_value: "false"
 
-  - id: camera_1_t1_offset
+  - id: camera_1_t1_offset_v122
     type: float
     restore_value: yes
     initial_value: "15.0"
@@ -282,7 +307,7 @@ globals:
     type: float
     restore_value: yes
     initial_value: "32.0"
-  - id: camera_1_t1_floor
+  - id: camera_1_t1_floor_v122
     type: float
     restore_value: yes
     initial_value: "-60.0"
@@ -308,7 +333,7 @@ globals:
     restore_value: yes
     initial_value: "-32.0"
 
-  - id: alarm_t1_confirm_ms
+  - id: alarm_t1_confirm_ms_v122
     type: uint32_t
     restore_value: yes
     initial_value: "1000"
@@ -316,6 +341,19 @@ globals:
     type: uint32_t
     restore_value: yes
     initial_value: "1000"
+
+  - id: alarm_t1_hold_ms_v120d2
+    type: uint32_t
+    restore_value: yes
+    initial_value: "20000"
+  - id: alarm_t2_hold_ms_v120d2
+    type: uint32_t
+    restore_value: yes
+    initial_value: "60000"
+  - id: alarm_audio_hysteresis_db_v120d2
+    type: float
+    restore_value: yes
+    initial_value: "2.0"
 
   - id: camera_1_motion_until
     type: uint32_t
@@ -329,7 +367,7 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: "0"
-  - id: camera_1_external_level2_until
+  - id: camera_1_cry_until
     type: uint32_t
     restore_value: no
     initial_value: "0"
@@ -337,6 +375,11 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: "0"
+
+  - id: local_motion_hold_ms_v130d1
+    type: uint32_t
+    restore_value: no
+    initial_value: "20000"
   - id: camera_2_sound1_until
     type: uint32_t
     restore_value: no
@@ -345,7 +388,7 @@ globals:
     type: uint32_t
     restore_value: no
     initial_value: "0"
-  - id: camera_2_external_level2_until
+  - id: camera_2_cry_until
     type: uint32_t
     restore_value: no
     initial_value: "0"
@@ -375,11 +418,28 @@ globals:
     restore_value: no
     initial_value: "0"
 
-  - id: camera_1_ha_last_ms
+  - id: camera_1_t1_armed_v120d5
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: camera_1_t2_armed_v120d5
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: camera_2_t1_armed_v120d5
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: camera_2_t2_armed_v120d5
+    type: bool
+    restore_value: no
+    initial_value: "false"
+
+  - id: camera_1_sound_last_ms
     type: uint32_t
     restore_value: no
     initial_value: "0"
-  - id: camera_2_ha_last_ms
+  - id: camera_2_sound_last_ms
     type: uint32_t
     restore_value: no
     initial_value: "0"
@@ -431,21 +491,23 @@ switch:
     turn_on_action:
       - output.turn_on: backlight_output
       - lambda: |-
-          const bool effective_audio = id(audio_ha_requested) && !id(hardware_mute_active);
+          const bool effective_audio = id(audio_ha_requested_v113) && !id(hardware_mute_active);
           id(camera_audio_enabled).publish_state(effective_audio);
           id(baby_monitor_media).set_audio_enabled(effective_audio);
           if (effective_audio) id(speaker_amp_enable).turn_on();
           else id(speaker_amp_enable).turn_off();
       - delay: 20ms
       - lambda: |-
-          id(camera_1_motion_until) = id(camera_1_sound1_until) = id(camera_1_sound2_until) = id(camera_1_external_level2_until) = 0;
-          id(camera_2_motion_until) = id(camera_2_sound1_until) = id(camera_2_sound2_until) = id(camera_2_external_level2_until) = 0;
+          id(camera_1_motion_until) = id(camera_1_sound1_until) = id(camera_1_sound2_until) = id(camera_1_cry_until) = 0;
+          id(camera_2_motion_until) = id(camera_2_sound1_until) = id(camera_2_sound2_until) = id(camera_2_cry_until) = 0;
           id(camera_1_sound_gate) = false;
           id(camera_2_sound_gate) = false;
+          id(camera_1_t1_armed_v120d5) = id(camera_1_t2_armed_v120d5) = false;
+          id(camera_2_t1_armed_v120d5) = id(camera_2_t2_armed_v120d5) = false;
           id(active_alarm_level) = 0;
-          id(baby_monitor_media).set_alarm_level(0);
-          id(baby_monitor_media).set_audio_enabled(id(audio_ha_requested) && !id(hardware_mute_active));
-          id(baby_monitor_media).set_audio_volume((id(camera_audio_volume_pct) / 100.0f) * 0.20f);
+          id(baby_monitor_media).set_alarm_level(0); id(baby_monitor_media).set_alarm_cause_mask(0);
+          id(baby_monitor_media).set_audio_enabled(id(audio_ha_requested_v113) && !id(hardware_mute_active));
+          id(baby_monitor_media).set_audio_volume((id(camera_audio_volume_pct_v122) / 100.0f) * 0.20f);
           id(baby_monitor_media).set_enabled(true);
 
     turn_off_action:
@@ -453,11 +515,13 @@ switch:
           if (id(night_mode).state) id(night_mode).publish_state(false);
           id(night_wake_until) = 0;
           id(active_alarm_level) = 0;
-          id(baby_monitor_media).set_alarm_level(0);
-          id(camera_1_motion_until) = id(camera_1_sound1_until) = id(camera_1_sound2_until) = id(camera_1_external_level2_until) = 0;
-          id(camera_2_motion_until) = id(camera_2_sound1_until) = id(camera_2_sound2_until) = id(camera_2_external_level2_until) = 0;
+          id(baby_monitor_media).set_alarm_level(0); id(baby_monitor_media).set_alarm_cause_mask(0);
+          id(camera_1_motion_until) = id(camera_1_sound1_until) = id(camera_1_sound2_until) = id(camera_1_cry_until) = 0;
+          id(camera_2_motion_until) = id(camera_2_sound1_until) = id(camera_2_sound2_until) = id(camera_2_cry_until) = 0;
           id(camera_1_sound_gate) = false;
           id(camera_2_sound_gate) = false;
+          id(camera_1_t1_armed_v120d5) = id(camera_1_t2_armed_v120d5) = false;
+          id(camera_2_t1_armed_v120d5) = id(camera_2_t2_armed_v120d5) = false;
           id(baby_monitor_media).set_enabled(false);
       - output.turn_off: speaker_amp_enable
       - output.turn_off: backlight_output
@@ -495,7 +559,7 @@ switch:
     restore_mode: DISABLED
     turn_on_action:
       - lambda: |-
-          id(audio_ha_requested) = true;
+          id(audio_ha_requested_v113) = true;
           const bool effective = !id(hardware_mute_active);
           id(camera_audio_enabled).publish_state(effective);
           id(baby_monitor_media).set_audio_enabled(effective);
@@ -503,7 +567,7 @@ switch:
           else id(speaker_amp_enable).turn_off();
     turn_off_action:
       - lambda: |-
-          id(audio_ha_requested) = false;
+          id(audio_ha_requested_v113) = false;
           id(camera_audio_enabled).publish_state(false);
           id(baby_monitor_media).set_audio_enabled(false);
           id(speaker_amp_enable).turn_off();
@@ -515,20 +579,22 @@ select:
     icon: "mdi:cctv"
     optimistic: true
     restore_value: false
-    initial_option: "Camera 1"
+    initial_option: "${camera_1_name}"
     options:
-      - "Camera 1"
-      - "Camera 2"
+      - "${camera_1_name}"
+      - "${camera_2_name}"
 
     set_action:
       - lambda: |-
           id(active_alarm_level) = 0;
-          id(baby_monitor_media).set_alarm_level(0);
-          id(camera_1_motion_until) = id(camera_1_sound1_until) = id(camera_1_sound2_until) = id(camera_1_external_level2_until) = 0;
-          id(camera_2_motion_until) = id(camera_2_sound1_until) = id(camera_2_sound2_until) = id(camera_2_external_level2_until) = 0;
+          id(baby_monitor_media).set_alarm_level(0); id(baby_monitor_media).set_alarm_cause_mask(0);
+          id(camera_1_motion_until) = id(camera_1_sound1_until) = id(camera_1_sound2_until) = id(camera_1_cry_until) = 0;
+          id(camera_2_motion_until) = id(camera_2_sound1_until) = id(camera_2_sound2_until) = id(camera_2_cry_until) = 0;
           id(camera_1_sound_gate) = false;
           id(camera_2_sound_gate) = false;
-          if (x == "Camera 2") {
+          id(camera_1_t1_armed_v120d5) = id(camera_1_t2_armed_v120d5) = false;
+          id(camera_2_t1_armed_v120d5) = id(camera_2_t2_armed_v120d5) = false;
+          if (x == "${camera_2_name}") {
             id(active_camera_index) = 1;
             id(baby_monitor_media).set_camera(1);
           } else {
@@ -554,7 +620,7 @@ number:
       - lambda: id(night_alarm_wake_seconds) = x;
 
   - platform: template
-    id: camera_audio_volume
+    id: camera_audio_volume_v122
     name: "Camera Volume"
     icon: "mdi:volume-medium"
     entity_category: config
@@ -567,12 +633,12 @@ number:
     initial_value: 25
     set_action:
       - lambda: |-
-          id(camera_audio_volume_pct) = x;
+          id(camera_audio_volume_pct_v122) = x;
           id(baby_monitor_media).set_audio_volume((x / 100.0f) * 0.20f);
 
   - platform: template
-    id: camera_1_t1_offset_number
-    name: "Camera 1 T1 offset"
+    id: camera_1_t1_offset_v122_number
+    name: "${camera_1_name} T1 Offset"
     icon: "mdi:tune-vertical"
     entity_category: config
     unit_of_measurement: "dB"
@@ -583,11 +649,11 @@ number:
     restore_value: true
     initial_value: 15
     set_action:
-      - lambda: id(camera_1_t1_offset) = x;
+      - lambda: id(camera_1_t1_offset_v122) = x;
 
   - platform: template
-    id: camera_1_t1_floor_number
-    name: "Camera 1 T1 floor"
+    id: camera_1_t1_floor_v122_number
+    name: "${camera_1_name} T1 Floor"
     icon: "mdi:volume-medium"
     entity_category: config
     unit_of_measurement: "dB"
@@ -598,11 +664,11 @@ number:
     restore_value: true
     initial_value: -60
     set_action:
-      - lambda: id(camera_1_t1_floor) = x;
+      - lambda: id(camera_1_t1_floor_v122) = x;
 
   - platform: template
     id: camera_1_t2_offset_number
-    name: "Camera 1 T2 offset"
+    name: "${camera_1_name} T2 Offset"
     icon: "mdi:tune-vertical"
     entity_category: config
     unit_of_measurement: "dB"
@@ -617,7 +683,7 @@ number:
 
   - platform: template
     id: camera_1_t2_floor_number
-    name: "Camera 1 T2 floor"
+    name: "${camera_1_name} T2 Floor"
     icon: "mdi:volume-high"
     entity_category: config
     unit_of_measurement: "dB"
@@ -632,7 +698,7 @@ number:
 
   - platform: template
     id: camera_2_t1_offset_number
-    name: "Camera 2 T1 offset"
+    name: "${camera_2_name} T1 Offset"
     icon: "mdi:tune-vertical"
     entity_category: config
     unit_of_measurement: "dB"
@@ -647,7 +713,7 @@ number:
 
   - platform: template
     id: camera_2_t1_floor_number
-    name: "Camera 2 T1 floor"
+    name: "${camera_2_name} T1 Floor"
     icon: "mdi:volume-medium"
     entity_category: config
     unit_of_measurement: "dB"
@@ -662,7 +728,7 @@ number:
 
   - platform: template
     id: camera_2_t2_offset_number
-    name: "Camera 2 T2 offset"
+    name: "${camera_2_name} T2 Offset"
     icon: "mdi:tune-vertical"
     entity_category: config
     unit_of_measurement: "dB"
@@ -677,7 +743,7 @@ number:
 
   - platform: template
     id: camera_2_t2_floor_number
-    name: "Camera 2 T2 floor"
+    name: "${camera_2_name} T2 Floor"
     icon: "mdi:volume-high"
     entity_category: config
     unit_of_measurement: "dB"
@@ -691,7 +757,7 @@ number:
       - lambda: id(camera_2_t2_floor) = x;
 
   - platform: template
-    id: alarm_t1_confirm_number
+    id: alarm_t1_confirm_number_v122
     name: "Alarm T1 Confirmation"
     icon: "mdi:timer-outline"
     entity_category: config
@@ -703,7 +769,7 @@ number:
     restore_value: true
     initial_value: 1.0
     set_action:
-      - lambda: id(alarm_t1_confirm_ms) = (uint32_t) lroundf(x * 1000.0f);
+      - lambda: id(alarm_t1_confirm_ms_v122) = (uint32_t) lroundf(x * 1000.0f);
 
   - platform: template
     id: alarm_t2_confirm_number
@@ -720,6 +786,173 @@ number:
     set_action:
       - lambda: id(alarm_t2_confirm_ms) = (uint32_t) lroundf(x * 1000.0f);
 
+  - platform: template
+    id: alarm_t1_hold_number_v120d2
+    name: "Alarm T1 Hold"
+    icon: "mdi:timer-sand"
+    entity_category: config
+    unit_of_measurement: "s"
+    min_value: 5
+    max_value: 120
+    step: 5
+    optimistic: true
+    restore_value: true
+    initial_value: 20
+    set_action:
+      - lambda: id(alarm_t1_hold_ms_v120d2) = (uint32_t) lroundf(x * 1000.0f);
+
+  - platform: template
+    id: alarm_t2_hold_number_v120d2
+    name: "Alarm T2 Hold"
+    icon: "mdi:timer-sand-complete"
+    entity_category: config
+    unit_of_measurement: "s"
+    min_value: 10
+    max_value: 300
+    step: 10
+    optimistic: true
+    restore_value: true
+    initial_value: 60
+    set_action:
+      - lambda: id(alarm_t2_hold_ms_v120d2) = (uint32_t) lroundf(x * 1000.0f);
+
+  - platform: template
+    id: alarm_audio_hysteresis_number_v120d2
+    name: "Alarm Audio Hysteresis"
+    icon: "mdi:arrow-expand-vertical"
+    entity_category: config
+    unit_of_measurement: "dB"
+    min_value: 0
+    max_value: 6
+    step: 0.5
+    optimistic: true
+    restore_value: true
+    initial_value: 2.0
+    set_action:
+      - lambda: id(alarm_audio_hysteresis_db_v120d2) = x;
+
+
+  - platform: template
+    id: local_motion_luma_threshold_number_v130d1
+    name: "Motion Luma Threshold"
+    icon: "mdi:image-filter-center-focus-weak"
+    entity_category: config
+    unit_of_measurement: "luma"
+    min_value: 4
+    max_value: 40
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 12
+    set_action:
+      - lambda: id(baby_monitor_media).set_motion_luma_threshold((uint8_t) lroundf(x));
+
+  - platform: template
+    id: local_motion_score_threshold_number_v130d1
+    name: "Motion Area Threshold"
+    icon: "mdi:motion-sensor"
+    entity_category: config
+    unit_of_measurement: "%"
+    min_value: 1
+    max_value: 40
+    step: 0.5
+    optimistic: true
+    restore_value: true
+    initial_value: 8
+    set_action:
+      - lambda: id(baby_monitor_media).set_motion_score_threshold(x);
+
+  - platform: template
+    id: local_motion_confirm_number_v130d1
+    name: "Motion Confirmation"
+    icon: "mdi:timer-outline"
+    entity_category: config
+    unit_of_measurement: "s"
+    min_value: 0.2
+    max_value: 3.0
+    step: 0.2
+    optimistic: true
+    restore_value: true
+    initial_value: 0.4
+    set_action:
+      - lambda: id(baby_monitor_media).set_motion_confirm_ms((uint32_t) lroundf(x * 1000.0f));
+
+  - platform: template
+    id: local_motion_hold_number_v130d1
+    name: "Motion Hold"
+    icon: "mdi:timer-sand"
+    entity_category: config
+    unit_of_measurement: "s"
+    min_value: 5
+    max_value: 120
+    step: 5
+    optimistic: true
+    restore_value: true
+    initial_value: 20
+    set_action:
+      - lambda: id(local_motion_hold_ms_v130d1) = (uint32_t) lroundf(x * 1000.0f);
+
+
+  - platform: template
+    id: local_motion_scene_score_number_v130d2
+    name: "Motion Scene Area Threshold"
+    icon: "mdi:image-sync-outline"
+    entity_category: config
+    unit_of_measurement: "%"
+    min_value: 15
+    max_value: 90
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 30
+    set_action:
+      - lambda: id(baby_monitor_media).set_motion_scene_score_threshold(x);
+
+  - platform: template
+    id: local_motion_scene_luma_number_v130d2
+    name: "Motion Scene Luma Threshold"
+    icon: "mdi:brightness-6"
+    entity_category: config
+    unit_of_measurement: "luma"
+    min_value: 2
+    max_value: 30
+    step: 1
+    optimistic: true
+    restore_value: true
+    initial_value: 5
+    set_action:
+      - lambda: id(baby_monitor_media).set_motion_scene_luma_delta_threshold((uint8_t) lroundf(x));
+
+  - platform: template
+    id: local_motion_scene_settle_number_v130d2
+    name: "Motion Scene Settle Time"
+    icon: "mdi:timer-cog-outline"
+    entity_category: config
+    unit_of_measurement: "s"
+    min_value: 0.5
+    max_value: 4.0
+    step: 0.1
+    optimistic: true
+    restore_value: true
+    initial_value: 1.8
+    set_action:
+      - lambda: id(baby_monitor_media).set_motion_scene_settle_ms((uint32_t) lroundf(x * 1000.0f));
+
+
+  - platform: template
+    id: cry_ml_threshold_v140d1
+    name: "Cry ML Threshold"
+    icon: "mdi:baby-face-outline"
+    entity_category: config
+    min_value: 0.005
+    max_value: 0.300
+    step: 0.005
+    optimistic: true
+    restore_value: true
+    initial_value: 0.050
+    set_action:
+      - lambda: id(baby_monitor_media).set_cry_candidate_threshold(x);
+
 text_sensor:
   - platform: template
     id: last_alarm_reason
@@ -728,7 +961,44 @@ text_sensor:
     entity_category: diagnostic
     update_interval: never
 
+
+  - platform: template
+    id: cry_ml_status_v140d1
+    name: "Cry ML status"
+    icon: "mdi:state-machine"
+    entity_category: diagnostic
+    update_interval: 5s
+    lambda: |-
+      return {id(baby_monitor_media).get_cry_status()};
+
 binary_sensor:
+  - platform: template
+    id: cry_ml_ready_v140d1
+    name: "Cry ML Model Ready"
+    icon: "mdi:chip"
+    entity_category: diagnostic
+    lambda: return id(baby_monitor_media).is_cry_model_ready();
+
+  - platform: template
+    id: cry_ml_candidate_v140d1
+    name: "Cry ML Candidate"
+    icon: "mdi:baby-face"
+    entity_category: diagnostic
+    lambda: |-
+      if (!id(monitor_power).state || !id(baby_monitor_media).is_rtsp_connected() ||
+          !id(baby_monitor_media).is_cry_model_ready()) return false;
+      return id(baby_monitor_media).is_cry_ml_candidate();
+    on_press:
+      - lambda: |-
+          const uint32_t until = millis() + 60000UL;
+          if (id(active_camera_index) == 0) {
+            id(camera_1_cry_until) = until;
+            ESP_LOGI("alarm", "${camera_1_name}: LOCAL Cry ML -> level 2 hold 60s");
+          } else {
+            id(camera_2_cry_until) = until;
+            ESP_LOGI("alarm", "${camera_2_name}: LOCAL Cry ML -> level 2 hold 60s");
+          }
+
   - platform: gt911
     id: home_button
     gt911_id: box_touch
@@ -776,34 +1046,45 @@ binary_sensor:
     on_state:
       - lambda: |-
           id(hardware_mute_active) = x;
-          const bool effective = id(audio_ha_requested) && !x;
+          const bool effective = id(audio_ha_requested_v113) && !x;
           id(camera_audio_enabled).publish_state(effective);
           id(baby_monitor_media).set_audio_enabled(effective);
           if (effective && id(monitor_power).state) id(speaker_amp_enable).turn_on();
           else id(speaker_amp_enable).turn_off();
           ESP_LOGI("baby_mute", "Hardware MUTE=%s -> effective audio=%s", x ? "ON" : "OFF", effective ? "ON" : "OFF");
 
-  - platform: homeassistant
-    id: camera_1_motion
-    entity_id: ${camera_1_motion_entity}
-    internal: true
+  - platform: template
+    id: local_motion_detected_v130d1
+    name: "Local Motion"
+    icon: "mdi:motion-sensor"
+    entity_category: diagnostic
+    lambda: |-
+      if (!id(monitor_power).state || !id(baby_monitor_media).is_rtsp_connected() ||
+          !id(baby_monitor_media).has_motion_data()) return false;
+      return id(baby_monitor_media).is_motion_detected();
     on_press:
       - lambda: |-
-          if (id(monitor_power).state && id(active_camera_index) == 0) {
-            id(camera_1_motion_until) = millis() + 20000UL;
-            ESP_LOGI("alarm", "Camera 1: motion -> hold 20s");
+          const uint32_t until = millis() + id(local_motion_hold_ms_v130d1);
+          if (id(active_camera_index) == 0) {
+            id(camera_1_motion_until) = until;
+            ESP_LOGI("alarm", "${camera_1_name}: LOCAL motion -> hold %u ms",
+                     (unsigned) id(local_motion_hold_ms_v130d1));
+          } else {
+            id(camera_2_motion_until) = until;
+            ESP_LOGI("alarm", "${camera_2_name}: LOCAL motion -> hold %u ms",
+                     (unsigned) id(local_motion_hold_ms_v130d1));
           }
 
-  - platform: homeassistant
-    id: camera_2_motion
-    entity_id: ${camera_2_motion_entity}
-    internal: true
-    on_press:
-      - lambda: |-
-          if (id(monitor_power).state && id(active_camera_index) == 1) {
-            id(camera_2_motion_until) = millis() + 20000UL;
-            ESP_LOGI("alarm", "Camera 2: motion -> hold 20s");
-          }
+  - platform: template
+    id: local_motion_scene_change_v130d2
+    name: "Motion scene change"
+    icon: "mdi:image-sync-outline"
+    entity_category: diagnostic
+    lambda: |-
+      if (!id(monitor_power).state || !id(baby_monitor_media).is_rtsp_connected() ||
+          !id(baby_monitor_media).has_motion_data()) return false;
+      return id(baby_monitor_media).is_motion_scene_change_active();
+
 
   - platform: template
     id: rtsp_connected
@@ -812,6 +1093,14 @@ binary_sensor:
     entity_category: diagnostic
     lambda: |-
       return id(baby_monitor_media).is_rtsp_connected();
+
+  - platform: template
+    id: local_sound_active
+    name: "Sound Activity"
+    icon: "mdi:volume-high"
+    entity_category: diagnostic
+    lambda: |-
+      return id(monitor_power).state && id(baby_monitor_media).has_sound_data() && id(baby_monitor_media).is_sound_active();
 
 sensor:
   - platform: adc
@@ -876,23 +1165,41 @@ sensor:
       if (r >= -50.0f) return 100.0f;
       return 2.0f * (r + 100.0f);
 
-  - platform: homeassistant
+  - platform: template
     id: camera_1_sound_level
-    entity_id: ${camera_1_sound_entity}
     internal: true
+    unit_of_measurement: "dBFS"
+    accuracy_decimals: 1
+    update_interval: 250ms
+    lambda: |-
+      if (!(id(monitor_power).state && id(active_camera_index) == 0)) return NAN;
+      if (!id(baby_monitor_media).is_rtsp_connected() || !id(baby_monitor_media).has_sound_data()) return NAN;
+      return id(baby_monitor_media).get_sound_rms_dbfs();
     on_value:
       - lambda: |-
           if (isnan(x)) return;
           const uint32_t now = millis();
-          id(camera_1_ha_last_ms) = now;
-          float t1 = fmaxf(id(camera_1_baseline) + id(camera_1_t1_offset), id(camera_1_t1_floor));
+          id(camera_1_sound_last_ms) = now;
+          float t1 = fmaxf(id(camera_1_baseline) + id(camera_1_t1_offset_v122), id(camera_1_t1_floor_v122));
           float t2 = fmaxf(id(camera_1_baseline) + id(camera_1_t2_offset), id(camera_1_t2_floor));
-          const bool motion_or_external = ((int32_t)(id(camera_1_motion_until)-now) > 0) || ((int32_t)(id(camera_1_external_level2_until)-now) > 0);
-          if (x < t1 - 6.0f) {
-            id(camera_1_baseline) = 0.98f * id(camera_1_baseline) + 0.02f * x;
+
+          const bool candidate_active =
+              (id(camera_1_t1_started) != 0) || (id(camera_1_t2_started) != 0);
+          const bool near_or_above_t1 = x >= (t1 - 3.0f);
+
+          if (candidate_active || near_or_above_t1) {
+            id(camera_1_baseline_resume_after_ms_v120d4) = now + 3000UL;
             id(camera_1_ambient_started_ms)=0; id(camera_1_ambient_nudge_ms)=0;
             id(camera_1_ambient_candidate)=id(camera_1_ambient_min)=id(camera_1_ambient_max)=NAN;
-          } else if (!motion_or_external && x < t1 - 3.0f) {
+          } else if ((int32_t)(id(camera_1_baseline_resume_after_ms_v120d4) - now) > 0) {
+            id(camera_1_ambient_started_ms)=0; id(camera_1_ambient_nudge_ms)=0;
+            id(camera_1_ambient_candidate)=id(camera_1_ambient_min)=id(camera_1_ambient_max)=NAN;
+          } else if (x < t1 - 6.0f) {
+            id(camera_1_baseline) = 0.98f * id(camera_1_baseline) + 0.02f * x;
+            id(camera_1_baseline) = fmaxf(-82.0f, fminf(-60.0f, id(camera_1_baseline)));
+            id(camera_1_ambient_started_ms)=0; id(camera_1_ambient_nudge_ms)=0;
+            id(camera_1_ambient_candidate)=id(camera_1_ambient_min)=id(camera_1_ambient_max)=NAN;
+          } else if (x < t1 - 3.0f) {
             if (id(camera_1_ambient_started_ms)==0 || isnan(id(camera_1_ambient_candidate))) {
               id(camera_1_ambient_started_ms)=now; id(camera_1_ambient_nudge_ms)=now;
               id(camera_1_ambient_candidate)=id(camera_1_ambient_min)=id(camera_1_ambient_max)=x;
@@ -907,46 +1214,109 @@ sensor:
                 const float max_step=fminf(1.0f, fmaxf(0.02f, (now-id(camera_1_ambient_nudge_ms))/30000.0f));
                 const float d=id(camera_1_ambient_candidate)-id(camera_1_baseline);
                 id(camera_1_baseline)+=fmaxf(-max_step,fminf(max_step,d));
+                id(camera_1_baseline)=fmaxf(-82.0f, fminf(-60.0f, id(camera_1_baseline)));
                 id(camera_1_ambient_nudge_ms)=now;
               }
             }
-          } else {
-            id(camera_1_ambient_started_ms)=0; id(camera_1_ambient_nudge_ms)=0;
-            id(camera_1_ambient_candidate)=id(camera_1_ambient_min)=id(camera_1_ambient_max)=NAN;
           }
+
           if (!(id(monitor_power).state && id(active_camera_index) == 0)) {
-            id(camera_1_sound_gate) = false; id(camera_1_t1_started)=0; id(camera_1_t2_started)=0; return;
-          }
-          if (!id(camera_1_sound_gate)) {
-            if (x < t1 - 3.0f) id(camera_1_sound_gate) = true;
+            id(camera_1_sound_gate) = false;
+            id(camera_1_t1_started)=0;
+            id(camera_1_t2_started)=0;
+            id(camera_1_t1_armed_v120d5)=false;
+            id(camera_1_t2_armed_v120d5)=false;
             return;
           }
-          if (x >= t2) {
-            if (id(camera_1_t2_started)==0) id(camera_1_t2_started)=now;
-            if ((uint32_t)(now-id(camera_1_t2_started)) >= id(alarm_t2_confirm_ms)) id(camera_1_sound2_until)=now+60000UL;
-          } else id(camera_1_t2_started)=0;
-          if (x >= t1) {
-            if (id(camera_1_t1_started)==0) id(camera_1_t1_started)=now;
-            if ((uint32_t)(now-id(camera_1_t1_started)) >= id(alarm_t1_confirm_ms)) id(camera_1_sound1_until)=now+20000UL;
-          } else id(camera_1_t1_started)=0;
 
-  - platform: homeassistant
+          const float hyst = id(alarm_audio_hysteresis_db_v120d2);
+
+          if (!id(camera_1_sound_gate)) {
+            if (x < t1 - 3.0f) {
+              id(camera_1_sound_gate) = true;
+              id(camera_1_t1_armed_v120d5) = true;
+              id(camera_1_t2_armed_v120d5) = true;
+            }
+            return;
+          }
+
+          if (!id(camera_1_t1_armed_v120d5) && x < t1 - hyst) {
+            id(camera_1_t1_armed_v120d5) = true;
+            id(camera_1_t1_started) = 0;
+          }
+          if (!id(camera_1_t2_armed_v120d5) && x < t2 - hyst) {
+            id(camera_1_t2_armed_v120d5) = true;
+            id(camera_1_t2_started) = 0;
+          }
+
+          if (id(camera_1_t2_armed_v120d5)) {
+            if (id(camera_1_t2_started)==0) {
+              if (x >= t2) id(camera_1_t2_started)=now;
+            } else if (x < t2 - hyst) {
+              id(camera_1_t2_started)=0;
+            }
+
+            if (id(camera_1_t2_started)!=0 &&
+                (uint32_t)(now-id(camera_1_t2_started)) >= id(alarm_t2_confirm_ms)) {
+              if ((int32_t)(id(camera_1_sound2_until) - now) <= 0) {
+                id(camera_1_sound2_until)=now+id(alarm_t2_hold_ms_v120d2);
+              }
+              id(camera_1_t2_armed_v120d5)=false;
+              id(camera_1_t2_started)=0;
+            }
+          }
+
+          if (id(camera_1_t1_armed_v120d5)) {
+            if (id(camera_1_t1_started)==0) {
+              if (x >= t1) id(camera_1_t1_started)=now;
+            } else if (x < t1 - hyst) {
+              id(camera_1_t1_started)=0;
+            }
+
+            if (id(camera_1_t1_started)!=0 &&
+                (uint32_t)(now-id(camera_1_t1_started)) >= id(alarm_t1_confirm_ms_v122)) {
+              if ((int32_t)(id(camera_1_sound1_until) - now) <= 0) {
+                id(camera_1_sound1_until)=now+id(alarm_t1_hold_ms_v120d2);
+              }
+              id(camera_1_t1_armed_v120d5)=false;
+              id(camera_1_t1_started)=0;
+            }
+          }
+  - platform: template
     id: camera_2_sound_level
-    entity_id: ${camera_2_sound_entity}
     internal: true
+    unit_of_measurement: "dBFS"
+    accuracy_decimals: 1
+    update_interval: 250ms
+    lambda: |-
+      if (!(id(monitor_power).state && id(active_camera_index) == 1)) return NAN;
+      if (!id(baby_monitor_media).is_rtsp_connected() || !id(baby_monitor_media).has_sound_data()) return NAN;
+      return id(baby_monitor_media).get_sound_rms_dbfs();
     on_value:
       - lambda: |-
           if (isnan(x)) return;
           const uint32_t now = millis();
-          id(camera_2_ha_last_ms) = now;
+          id(camera_2_sound_last_ms) = now;
           float t1 = fmaxf(id(camera_2_baseline) + id(camera_2_t1_offset), id(camera_2_t1_floor));
           float t2 = fmaxf(id(camera_2_baseline) + id(camera_2_t2_offset), id(camera_2_t2_floor));
-          const bool motion_or_external = ((int32_t)(id(camera_2_motion_until)-now) > 0) || ((int32_t)(id(camera_2_external_level2_until)-now) > 0);
-          if (x < t1 - 6.0f) {
-            id(camera_2_baseline) = 0.98f * id(camera_2_baseline) + 0.02f * x;
+
+          const bool candidate_active =
+              (id(camera_2_t1_started) != 0) || (id(camera_2_t2_started) != 0);
+          const bool near_or_above_t1 = x >= (t1 - 3.0f);
+
+          if (candidate_active || near_or_above_t1) {
+            id(camera_2_baseline_resume_after_ms_v120d4) = now + 3000UL;
             id(camera_2_ambient_started_ms)=0; id(camera_2_ambient_nudge_ms)=0;
             id(camera_2_ambient_candidate)=id(camera_2_ambient_min)=id(camera_2_ambient_max)=NAN;
-          } else if (!motion_or_external && x < t1 - 3.0f) {
+          } else if ((int32_t)(id(camera_2_baseline_resume_after_ms_v120d4) - now) > 0) {
+            id(camera_2_ambient_started_ms)=0; id(camera_2_ambient_nudge_ms)=0;
+            id(camera_2_ambient_candidate)=id(camera_2_ambient_min)=id(camera_2_ambient_max)=NAN;
+          } else if (x < t1 - 6.0f) {
+            id(camera_2_baseline) = 0.98f * id(camera_2_baseline) + 0.02f * x;
+            id(camera_2_baseline) = fmaxf(-82.0f, fminf(-60.0f, id(camera_2_baseline)));
+            id(camera_2_ambient_started_ms)=0; id(camera_2_ambient_nudge_ms)=0;
+            id(camera_2_ambient_candidate)=id(camera_2_ambient_min)=id(camera_2_ambient_max)=NAN;
+          } else if (x < t1 - 3.0f) {
             if (id(camera_2_ambient_started_ms)==0 || isnan(id(camera_2_ambient_candidate))) {
               id(camera_2_ambient_started_ms)=now; id(camera_2_ambient_nudge_ms)=now;
               id(camera_2_ambient_candidate)=id(camera_2_ambient_min)=id(camera_2_ambient_max)=x;
@@ -961,28 +1331,279 @@ sensor:
                 const float max_step=fminf(1.0f, fmaxf(0.02f, (now-id(camera_2_ambient_nudge_ms))/30000.0f));
                 const float d=id(camera_2_ambient_candidate)-id(camera_2_baseline);
                 id(camera_2_baseline)+=fmaxf(-max_step,fminf(max_step,d));
+                id(camera_2_baseline)=fmaxf(-82.0f, fminf(-60.0f, id(camera_2_baseline)));
                 id(camera_2_ambient_nudge_ms)=now;
               }
             }
-          } else {
-            id(camera_2_ambient_started_ms)=0; id(camera_2_ambient_nudge_ms)=0;
-            id(camera_2_ambient_candidate)=id(camera_2_ambient_min)=id(camera_2_ambient_max)=NAN;
           }
+
           if (!(id(monitor_power).state && id(active_camera_index) == 1)) {
-            id(camera_2_sound_gate) = false; id(camera_2_t1_started)=0; id(camera_2_t2_started)=0; return;
-          }
-          if (!id(camera_2_sound_gate)) {
-            if (x < t1 - 3.0f) id(camera_2_sound_gate) = true;
+            id(camera_2_sound_gate) = false;
+            id(camera_2_t1_started)=0;
+            id(camera_2_t2_started)=0;
+            id(camera_2_t1_armed_v120d5)=false;
+            id(camera_2_t2_armed_v120d5)=false;
             return;
           }
-          if (x >= t2) {
-            if (id(camera_2_t2_started)==0) id(camera_2_t2_started)=now;
-            if ((uint32_t)(now-id(camera_2_t2_started)) >= id(alarm_t2_confirm_ms)) id(camera_2_sound2_until)=now+60000UL;
-          } else id(camera_2_t2_started)=0;
-          if (x >= t1) {
-            if (id(camera_2_t1_started)==0) id(camera_2_t1_started)=now;
-            if ((uint32_t)(now-id(camera_2_t1_started)) >= id(alarm_t1_confirm_ms)) id(camera_2_sound1_until)=now+20000UL;
-          } else id(camera_2_t1_started)=0;
+
+          const float hyst = id(alarm_audio_hysteresis_db_v120d2);
+
+          if (!id(camera_2_sound_gate)) {
+            if (x < t1 - 3.0f) {
+              id(camera_2_sound_gate) = true;
+              id(camera_2_t1_armed_v120d5) = true;
+              id(camera_2_t2_armed_v120d5) = true;
+            }
+            return;
+          }
+
+          if (!id(camera_2_t1_armed_v120d5) && x < t1 - hyst) {
+            id(camera_2_t1_armed_v120d5) = true;
+            id(camera_2_t1_started) = 0;
+          }
+          if (!id(camera_2_t2_armed_v120d5) && x < t2 - hyst) {
+            id(camera_2_t2_armed_v120d5) = true;
+            id(camera_2_t2_started) = 0;
+          }
+
+          if (id(camera_2_t2_armed_v120d5)) {
+            if (id(camera_2_t2_started)==0) {
+              if (x >= t2) id(camera_2_t2_started)=now;
+            } else if (x < t2 - hyst) {
+              id(camera_2_t2_started)=0;
+            }
+
+            if (id(camera_2_t2_started)!=0 &&
+                (uint32_t)(now-id(camera_2_t2_started)) >= id(alarm_t2_confirm_ms)) {
+              if ((int32_t)(id(camera_2_sound2_until) - now) <= 0) {
+                id(camera_2_sound2_until)=now+id(alarm_t2_hold_ms_v120d2);
+              }
+              id(camera_2_t2_armed_v120d5)=false;
+              id(camera_2_t2_started)=0;
+            }
+          }
+
+          if (id(camera_2_t1_armed_v120d5)) {
+            if (id(camera_2_t1_started)==0) {
+              if (x >= t1) id(camera_2_t1_started)=now;
+            } else if (x < t1 - hyst) {
+              id(camera_2_t1_started)=0;
+            }
+
+            if (id(camera_2_t1_started)!=0 &&
+                (uint32_t)(now-id(camera_2_t1_started)) >= id(alarm_t1_confirm_ms_v122)) {
+              if ((int32_t)(id(camera_2_sound1_until) - now) <= 0) {
+                id(camera_2_sound1_until)=now+id(alarm_t1_hold_ms_v120d2);
+              }
+              id(camera_2_t1_armed_v120d5)=false;
+              id(camera_2_t1_started)=0;
+            }
+          }
+  - platform: template
+    id: local_sound_dbfs_diagnostic
+    name: "Local Sound Level"
+    icon: "mdi:waveform"
+    unit_of_measurement: "dBFS"
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 1
+    update_interval: 2s
+    lambda: |-
+      if (!id(monitor_power).state || !id(baby_monitor_media).is_rtsp_connected() || !id(baby_monitor_media).has_sound_data()) return NAN;
+      return id(baby_monitor_media).get_sound_dbfs();
+
+  - platform: template
+    id: local_sound_rms_dbfs_diagnostic_v120d5
+    name: "Sound RMS dBFS"
+    icon: "mdi:sine-wave"
+    unit_of_measurement: "dBFS"
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 1
+    update_interval: 2s
+    lambda: |-
+      if (!id(monitor_power).state || !id(baby_monitor_media).is_rtsp_connected() || !id(baby_monitor_media).has_sound_data()) return NAN;
+      return id(baby_monitor_media).get_sound_rms_dbfs();
+
+  - platform: template
+    id: local_sound_rms_diagnostic
+    name: "Sound RMS"
+    icon: "mdi:sine-wave"
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 4
+    update_interval: 2s
+    lambda: |-
+      if (!id(monitor_power).state || !id(baby_monitor_media).is_rtsp_connected() || !id(baby_monitor_media).has_sound_data()) return NAN;
+      return id(baby_monitor_media).get_sound_rms();
+
+  - platform: template
+    id: local_sound_peak_diagnostic
+    name: "Sound Peak"
+    icon: "mdi:chart-bell-curve"
+    unit_of_measurement: "dBFS"
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 1
+    update_interval: 2s
+    lambda: |-
+      if (!id(monitor_power).state || !id(baby_monitor_media).is_rtsp_connected() || !id(baby_monitor_media).has_sound_data()) return NAN;
+      return id(baby_monitor_media).get_sound_peak_dbfs();
+
+  - platform: template
+    id: local_motion_score_v130d1
+    name: "Motion score"
+    icon: "mdi:motion-sensor"
+    unit_of_measurement: "%"
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 1
+    update_interval: 2s
+    lambda: |-
+      if (!id(monitor_power).state || !id(baby_monitor_media).is_rtsp_connected() ||
+          !id(baby_monitor_media).has_motion_data()) return NAN;
+      return id(baby_monitor_media).get_motion_score();
+
+  - platform: template
+    id: local_motion_global_delta_v130d1
+    name: "Motion global luma delta"
+    icon: "mdi:brightness-6"
+    unit_of_measurement: "luma"
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 1s
+    lambda: |-
+      if (!id(monitor_power).state || !id(baby_monitor_media).is_rtsp_connected() ||
+          !id(baby_monitor_media).has_motion_data()) return NAN;
+      return id(baby_monitor_media).get_motion_global_luma_delta();
+
+  - platform: template
+    id: local_motion_scene_count_v130d2
+    name: "Motion scene change count"
+    icon: "mdi:counter"
+    state_class: total_increasing
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: |-
+      if (!id(baby_monitor_media).has_motion_data()) return 0;
+      return id(baby_monitor_media).get_motion_scene_change_count();
+
+  - platform: template
+    id: cry_ml_score_v140d1
+    name: "Cry ML score"
+    icon: "mdi:baby-face-outline"
+    unit_of_measurement: "%"
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 2
+    update_interval: 2s
+    lambda: |-
+      if (!id(baby_monitor_media).is_cry_model_ready()) return NAN;
+      return 100.0f * id(baby_monitor_media).get_cry_ml_score();
+
+  - platform: template
+    id: cry_ml_baby_score_v140d1
+    name: "Cry ML baby cry"
+    unit_of_measurement: "%"
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 2
+    update_interval: 2s
+    lambda: |-
+      if (!id(baby_monitor_media).is_cry_model_ready()) return NAN;
+      return 100.0f * id(baby_monitor_media).get_cry_baby_score();
+
+  - platform: template
+    id: cry_ml_crying_score_v140d1
+    name: "Cry ML crying"
+    unit_of_measurement: "%"
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 2
+    update_interval: 2s
+    lambda: |-
+      if (!id(baby_monitor_media).is_cry_model_ready()) return NAN;
+      return 100.0f * id(baby_monitor_media).get_cry_crying_score();
+
+  - platform: template
+    id: cry_ml_speech_score_v140d1
+    name: "Cry ML speech"
+    unit_of_measurement: "%"
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 2
+    update_interval: 2s
+    lambda: |-
+      if (!id(baby_monitor_media).is_cry_model_ready()) return NAN;
+      return 100.0f * id(baby_monitor_media).get_cry_speech_score();
+
+  - platform: template
+    id: cry_ml_yell_scream_score_v140d1
+    name: "Cry ML yell scream"
+    unit_of_measurement: "%"
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 2
+    update_interval: 2s
+    lambda: |-
+      if (!id(baby_monitor_media).is_cry_model_ready()) return NAN;
+      return 100.0f * id(baby_monitor_media).get_cry_yell_scream_score();
+
+  - platform: template
+    id: cry_ml_babbling_score_v140d1
+    name: "Cry ML babbling"
+    unit_of_measurement: "%"
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 2
+    update_interval: 2s
+    lambda: |-
+      if (!id(baby_monitor_media).is_cry_model_ready()) return NAN;
+      return 100.0f * id(baby_monitor_media).get_cry_babbling_score();
+
+  - platform: template
+    id: cry_ml_inference_ms_v140d1
+    name: "Cry ML inference"
+    icon: "mdi:timer-outline"
+    unit_of_measurement: "ms"
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: return id(baby_monitor_media).get_cry_inference_ms();
+
+  - platform: template
+    id: cry_ml_inference_count_v140d1
+    name: "Cry ML inference count"
+    icon: "mdi:counter"
+    state_class: total_increasing
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: return id(baby_monitor_media).get_cry_inference_count();
+
+  - platform: template
+    id: cry_ml_dropped_windows_v140d1
+    name: "Cry ML dropped windows"
+    icon: "mdi:alert-circle-outline"
+    state_class: total_increasing
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: return id(baby_monitor_media).get_cry_dropped_windows();
+
+  - platform: template
+    id: cry_ml_model_bytes_v140d1
+    name: "Cry ML model size"
+    icon: "mdi:memory"
+    unit_of_measurement: "B"
+    state_class: measurement
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    update_interval: 30s
+    lambda: return id(baby_monitor_media).get_cry_model_bytes();
 
   - platform: template
     id: free_ram_diagnostic
@@ -1119,7 +1740,7 @@ interval:
       - lambda: |-
           const uint32_t now = millis();
           if (!id(monitor_power).state) {
-            if (id(active_alarm_level) != 0) { id(active_alarm_level)=0; id(baby_monitor_media).set_alarm_level(0); }
+            if (id(active_alarm_level) != 0) { id(active_alarm_level)=0; id(baby_monitor_media).set_alarm_level(0); id(baby_monitor_media).set_alarm_cause_mask(0); }
             return;
           }
 
@@ -1131,26 +1752,26 @@ interval:
           }
 
           const bool camera_1 = id(active_camera_index) == 0;
-          const uint32_t fresh = camera_1 ? id(camera_1_ha_last_ms) : id(camera_2_ha_last_ms);
+          const uint32_t fresh = camera_1 ? id(camera_1_sound_last_ms) : id(camera_2_sound_last_ms);
           if (fresh == 0 || (uint32_t)(now - fresh) > 30000UL) {
             if (id(active_alarm_level) != 0) {
-              ESP_LOGW("alarm", "HA alarm feed stale >30s; clearing alarm");
-              id(active_alarm_level)=0; id(baby_monitor_media).set_alarm_level(0);
+              ESP_LOGW("alarm", "Local sound feed stale >30s; clearing alarm");
+              id(active_alarm_level)=0; id(baby_monitor_media).set_alarm_level(0); id(baby_monitor_media).set_alarm_cause_mask(0);
             }
             return;
           }
 
-          uint32_t motion_until, s1_until, s2_until, external_level2_until;
+          uint32_t motion_until, s1_until, s2_until, cry_until;
           float baseline, t1, t2;
           if (camera_1) {
             motion_until=id(camera_1_motion_until); s1_until=id(camera_1_sound1_until);
-            s2_until=id(camera_1_sound2_until); external_level2_until=id(camera_1_external_level2_until);
+            s2_until=id(camera_1_sound2_until); cry_until=id(camera_1_cry_until);
             baseline=id(camera_1_baseline);
-            t1=fmaxf(baseline+id(camera_1_t1_offset), id(camera_1_t1_floor));
+            t1=fmaxf(baseline+id(camera_1_t1_offset_v122), id(camera_1_t1_floor_v122));
             t2=fmaxf(baseline+id(camera_1_t2_offset), id(camera_1_t2_floor));
           } else {
             motion_until=id(camera_2_motion_until); s1_until=id(camera_2_sound1_until);
-            s2_until=id(camera_2_sound2_until); external_level2_until=id(camera_2_external_level2_until);
+            s2_until=id(camera_2_sound2_until); cry_until=id(camera_2_cry_until);
             baseline=id(camera_2_baseline);
             t1=fmaxf(baseline+id(camera_2_t1_offset), id(camera_2_t1_floor));
             t2=fmaxf(baseline+id(camera_2_t2_offset), id(camera_2_t2_floor));
@@ -1160,10 +1781,17 @@ interval:
           const bool motion = (int32_t)(motion_until - now) > 0;
           const bool sound1 = (int32_t)(s1_until - now) > 0;
           const bool sound2 = (int32_t)(s2_until - now) > 0;
-          const bool external_level2 = (int32_t)(external_level2_until - now) > 0;
+          const bool cry = (int32_t)(cry_until - now) > 0;
           int level = 0;
-          if (external_level2 || sound2 || (motion && sound1)) level = 2;
+          if (cry || sound2 || (motion && sound1)) level = 2;
           else if (motion || sound1) level = 1;
+
+          uint8_t cause_mask = 0;
+          if (motion) cause_mask |= 0x01U;
+          if (sound2) cause_mask |= 0x04U;
+          else if (sound1) cause_mask |= 0x02U;
+          if (cry) cause_mask |= 0x08U;
+          id(baby_monitor_media).set_alarm_cause_mask(cause_mask);
 
           if (id(night_mode).state && level > 0) {
             const uint32_t wake_ms = (uint32_t) lroundf(id(night_alarm_wake_seconds) * 1000.0f);
@@ -1172,13 +1800,13 @@ interval:
           }
 
           if (level != id(active_alarm_level)) {
-            ESP_LOGI("alarm", "%s alarm %d -> %d (B=%.1f T1=%.1f T2=%.1f m=%d s=%d s2=%d ext2=%d)",
-                     camera_1 ? "Camera 1" : "Camera 2", id(active_alarm_level), level,
-                     baseline, t1, t2, motion, sound1, sound2, external_level2);
+            ESP_LOGI("alarm", "%s alarm %d -> %d (B=%.1f T1=%.1f T2=%.1f m=%d s=%d s2=%d cry=%d)",
+                     camera_1 ? "${camera_1_name}" : "${camera_2_name}", id(active_alarm_level), level,
+                     baseline, t1, t2, motion, sound1, sound2, cry);
 
             if (level > 0 && level > id(active_alarm_level)) {
-              std::string reason = camera_1 ? "Camera 1: " : "Camera 2: ";
-              if (external_level2) reason += "external level 2 event";
+              std::string reason = camera_1 ? "${camera_1_name}: " : "${camera_2_name}: ";
+              if (cry) reason += "Cry ML";
               else if (sound2) reason += "sound T2";
               else if (motion && sound1) reason += "motion + sound T1";
               else if (sound1) reason += "sound T1";
